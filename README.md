@@ -33,7 +33,30 @@ H = Hamiltonian(basis, terms)
 eigvals(H)
 ```
 
-The implementation currently prioritizes semantic completeness and a small
-native design. Some large sparse workloads still use dense reference kernels;
-those backends can be replaced with specialized sparse/Krylov implementations
-without changing the public Julia API.
+## Dense and sparse storage
+
+`Hamiltonian` and `QuantumOperator` support two real internal storage paths:
+Julia `Matrix` (`:dense`) and `SparseArrays.SparseMatrixCSC` (`:csc`).
+Construction with `static_fmt=:csc` assembles CSC triplets directly instead
+of materializing a dense matrix first. Dynamic terms can independently use
+`dynamic_fmt=:csc`, and `eigsh` uses ARPACK's iterative sparse eigensolver.
+
+```julia
+using SparseArrays
+
+H = Hamiltonian(basis, terms; static_fmt=:csc)
+@assert H.data isa SparseMatrixCSC
+lowest, states = eigsh(H; k=4, which=:SA)
+```
+
+Julia's standard library does not provide CSR or DIA matrix types. Requests
+for `:csr` or `:dia`, including `tocsr`, therefore fail explicitly rather than
+returning a CSC matrix under the wrong name. Use `tocsc`, `as_sparse_format`,
+or `update_matrix_formats!(H, :csc)`.
+
+The integration suite includes reduced, deterministic versions of workflows
+used in the literature: random-field XXZ mid-spectrum states
+(Pal–Huse, arXiv:1003.2613), sparse Lanczos quantum-quench evolution, and a
+periodically driven spin chain (QuSpin paper, arXiv:1610.03042). These tests
+validate the numerical workflow and storage path; they do not claim to
+reproduce the papers' finite-size scaling results.

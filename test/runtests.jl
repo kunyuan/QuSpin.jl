@@ -1,5 +1,6 @@
 using Test
 using LinearAlgebra
+using SparseArrays
 using QuSpin
 
 @testset "Public API namespaces" begin
@@ -678,8 +679,10 @@ end
     values, vectors = eigh(H)
     @test matrix * vectors ≈ vectors * Diagonal(values) atol=1e-14
     sparse_values, sparse_vectors = eigsh(H; k=2, which=:SA)
-    @test sparse_values == values[1:2]
+    @test sparse_values ≈ values[1:2] atol=2e-13
     @test size(sparse_vectors) == (4, 2)
+    @test eigsh(H; k=2, which=:SA, return_eigenvectors=false) ≈
+        values[1:2] atol=2e-13
 
     normalized = vector / norm(vector)
     @test expt_value(H, normalized) ≈ dot(normalized, matrix * normalized)
@@ -699,9 +702,14 @@ end
     @test toarray(H) == matrix
     @test todense(H) == matrix
     @test Matrix(tocsc(H)) == matrix
-    @test Matrix(tocsr(H)) == matrix
+    @test_throws ArgumentError tocsr(H)
     @test tr(H) == tr(matrix)
-    @test update_matrix_formats!(H, :csr, Dict()) === H
+    @test update_matrix_formats!(H, :csc, Dict()) === H
+    @test H.data isa SparseMatrixCSC
+    @test !H.is_dense
+    @test update_matrix_formats!(H, :dense, Dict()) === H
+    @test H.data isa Matrix
+    @test_throws ArgumentError update_matrix_formats!(H, :csr)
 end
 
 @testset "QuantumOperator native archive" begin
@@ -797,7 +805,7 @@ end
     @test toarray(operator; pars) == expected
     @test todense(operator; pars) == expected
     @test Matrix(tocsc(operator; pars)) == expected
-    @test Matrix(tocsr(operator; pars)) == expected
+    @test_throws ArgumentError tocsr(operator; pars)
     @test diagonal(operator; pars) == diag(expected)
     @test tr(operator; pars) == tr(expected)
     @test toarray(operator.H; pars) == expected'
@@ -816,7 +824,7 @@ end
     @test expected * vectors ≈ vectors * Diagonal(values) atol=2e-14
     @test eigvals(operator; pars) ≈ values atol=2e-14
     selected, selected_vectors = eigsh(operator; pars, k=2, which=:SA)
-    @test selected == values[1:2]
+    @test selected ≈ values[1:2] atol=2e-13
     @test size(selected_vectors) == (4, 2)
 
     expectation = dot(vector, expected * vector)
@@ -826,5 +834,12 @@ end
         dot(vector, expected^2 * vector) - expectation^2 atol=2e-15
     @test Matrix(tohamiltonian(operator; pars)) == expected
     @test Matrix(aslinearoperator(operator; pars)) == expected
-    @test update_matrix_formats!(operator, Dict(:x => :dense)) === operator
+    @test update_matrix_formats!(operator, Dict(:x => :csc)) === operator
+    @test operator.components[:x] isa SparseMatrixCSC
+    @test operator.is_dense
+    @test update_matrix_formats!(operator, Dict(:z => :csc)) === operator
+    @test !operator.is_dense
+    @test_throws ArgumentError update_matrix_formats!(operator, Dict(:x => :csr))
 end
+
+include("paper_workflows.jl")
