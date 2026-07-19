@@ -1,5 +1,6 @@
 module Operators
 
+using Arpack
 using LinearAlgebra
 using Serialization
 using SparseArrays
@@ -44,30 +45,77 @@ end
 
 Many-body operator assembled in the enumeration of `basis`.
 """
-struct Hamiltonian{T<:Number}
+const NativeMatrix{T} = Union{Matrix{T},SparseMatrixCSC{T,Int}}
+
+mutable struct Hamiltonian{T<:Number}
     basis::SpinBasis1D
     terms::Vector{OperatorTerm}
-    data::Matrix{T}
-    dynamic_terms::Vector{Tuple{Matrix{T},Any,Tuple}}
+    data::NativeMatrix{T}
+    dynamic_terms::Vector{Tuple{NativeMatrix{T},Any,Tuple}}
 end
 
-function _hamiltonian_from_data(basis::SpinBasis1D, data::AbstractMatrix)
-    matrix = Matrix(data)
+function _normalize_matrix_format(format; default=:dense)
+    format === nothing && return default
+    normalized = Symbol(lowercase(String(format)))
+    normalized === :sparse && return :csc
+    normalized in (:dense, :csc) && return normalized
+    normalized in (:csr, :dia) && throw(
+        ArgumentError(
+            "matrix format '$normalized' is not a native Julia storage format; " *
+            "use :csc for sparse storage or :dense",
+        ),
+    )
+    throw(ArgumentError("matrix format must be :dense or :csc"))
+end
+
+function _matrix_with_format(
+    data::AbstractMatrix,
+    ::Type{T},
+    format,
+;
+    copy_data::Bool=true,
+) where {T<:Number}
+    normalized = _normalize_matrix_format(format)
+    if normalized === :dense
+        return !copy_data && data isa Matrix{T} ? data : Matrix{T}(data)
+    end
+    if !copy_data && data isa SparseMatrixCSC{T,Int}
+        return data
+    end
+    return SparseMatrixCSC{T,Int}(sparse(data))
+end
+
+_storage_format(data::Matrix) = :dense
+_storage_format(data::SparseMatrixCSC) = :csc
+
+function _hamiltonian_from_data(
+    basis::SpinBasis1D,
+    data::AbstractMatrix;
+    format=_storage_format(data),
+    copy::Bool=true,
+)
+    T = eltype(data)
+    matrix = _matrix_with_format(data, T, format; copy_data=copy)
     return Hamiltonian{eltype(matrix)}(
         basis,
         OperatorTerm[],
         matrix,
-        Tuple{Matrix{eltype(matrix)},Any,Tuple}[],
+        Tuple{NativeMatrix{eltype(matrix)},Any,Tuple}[],
     )
 end
 
 function _coefficient_type(terms)
     coefficient_types = Type[]
-    for term in terms, coupling in term.couplings
-        push!(coefficient_types, typeof(first(coupling)))
+    complex_operator = false
+    for term in terms
+        complex_operator |= 'y' in term.op
+        for coupling in term.couplings
+            push!(coefficient_types, typeof(first(coupling)))
+        end
     end
     isempty(coefficient_types) && return Float64
-    return promote_type(Float64, coefficient_types...)
+    scalar_type = promote_type(Float64, coefficient_types...)
+    return complex_operator ? promote_type(ComplexF64, scalar_type) : scalar_type
 end
 
 @inline function _site_mask(basis::SpinBasis1D, site::Integer)
@@ -97,13 +145,26 @@ function _apply_local(
         occupied || return state, 0.0, false
         scale = basis.pauli ? 2.0 : 1.0
         return state & ~mask, scale, true
+    elseif op == 'x'
+        scale = basis.pauli ? 1.0 : 0.5
+        return xor(state, mask), scale, true
+    elseif op == 'y'
+        scale = basis.pauli ? 1.0 : 0.5
+        return xor(state, mask), occupied ? -im * scale : im * scale, true
     else
         throw(ArgumentError("unsupported spin operator '$op'"))
     end
 end
 
-function _assemble(basis::SpinBasis1D, terms::Vector{OperatorTerm}, ::Type{T}) where {T}
-    matrix = zeros(T, length(basis), length(basis))
+function _assemble(
+    basis::SpinBasis1D,
+    terms::AbstractVector{<:OperatorTerm},
+    ::Type{T},
+    format=:dense,
+) where {T}
+    rows = Int[]
+    columns = Int[]
+    values = T[]
     for (column, initial_state) in pairs(basis.encoded_states)
         for term in terms, coupling in term.couplings
             amplitude = convert(T, first(coupling))
@@ -117,20 +178,34 @@ function _assemble(basis::SpinBasis1D, terms::Vector{OperatorTerm}, ::Type{T}) w
             alive || continue
             row = get(basis.lookup, state, 0)
             iszero(row) && continue
-            matrix[row, column] += amplitude
+            push!(rows, row)
+            push!(columns, column)
+            push!(values, amplitude)
         end
+    end
+    normalized = _normalize_matrix_format(format)
+    if normalized === :csc
+        return sparse(rows, columns, values, length(basis), length(basis))
+    end
+    matrix = zeros(T, length(basis), length(basis))
+    for (row, column, value) in zip(rows, columns, values)
+        matrix[row, column] += value
     end
     return matrix
 end
 
-function Hamiltonian(basis::SpinBasis1D, terms::AbstractVector{<:OperatorTerm})
+function Hamiltonian(
+    basis::SpinBasis1D,
+    terms::AbstractVector{<:OperatorTerm};
+    static_fmt=:dense,
+)
     normalized = OperatorTerm[terms...]
     T = _coefficient_type(normalized)
     return Hamiltonian{T}(
         basis,
         normalized,
-        _assemble(basis, normalized, T),
-        Tuple{Matrix{T},Any,Tuple}[],
+        _assemble(basis, normalized, T, static_fmt),
+        Tuple{NativeMatrix{T},Any,Tuple}[],
     )
 end
 
@@ -192,14 +267,18 @@ function Hamiltonian(
     selected_basis isa SpinBasis1D ||
         throw(ArgumentError("the current Hamiltonian backend requires a SpinBasis1D"))
     terms, matrices = _normalize_operator_terms(static_list)
-    static_matrix = _assemble(selected_basis, terms, dtype)
+    static_format = _normalize_matrix_format(static_fmt)
+    dynamic_default = dynamic_fmt isa AbstractDict || dynamic_fmt === nothing ?
+        static_format :
+        _normalize_matrix_format(dynamic_fmt; default=static_format)
+    static_matrix = _assemble(selected_basis, terms, dtype, static_format)
     for matrix in matrices
         size(matrix) == size(static_matrix) ||
             throw(DimensionMismatch("static matrix has the wrong shape"))
-        static_matrix .+= Matrix{dtype}(matrix)
+        static_matrix += _matrix_with_format(matrix, dtype, static_format; copy_data=copy)
     end
 
-    dynamic_terms = Tuple{Matrix{dtype},Any,Tuple}[]
+    dynamic_terms = Tuple{NativeMatrix{dtype},Any,Tuple}[]
     for entry in dynamic_list
         (entry isa Tuple || entry isa AbstractVector) ||
             throw(ArgumentError("dynamic entries must be tuples or vectors"))
@@ -207,20 +286,35 @@ function Hamiltonian(
             length(entry) == 3 ||
                 throw(ArgumentError("dynamic matrix entries are [matrix, f, f_args]"))
             matrix, function_value, arguments = entry
-            dynamic_matrix = Matrix{dtype}(matrix)
         else
             length(entry) == 4 ||
                 throw(ArgumentError("dynamic operator entries are [op, couplings, f, f_args]"))
             op, couplings, function_value, arguments = entry
-            dynamic_matrix = _assemble(
+        end
+        arguments_tuple = Tuple(arguments)
+        entry_format = if dynamic_fmt isa AbstractDict
+            requested = get(
+                dynamic_fmt,
+                (function_value, arguments_tuple),
+                get(dynamic_fmt, function_value, dynamic_default),
+            )
+            _normalize_matrix_format(requested; default=dynamic_default)
+        else
+            dynamic_default
+        end
+        dynamic_matrix = if first(entry) isa AbstractMatrix
+            _matrix_with_format(matrix, dtype, entry_format; copy_data=copy)
+        else
+            _assemble(
                 selected_basis,
                 [OperatorTerm(String(op), collect(couplings))],
                 dtype,
+                entry_format,
             )
         end
         size(dynamic_matrix) == size(static_matrix) ||
             throw(DimensionMismatch("dynamic matrix has the wrong shape"))
-        push!(dynamic_terms, (dynamic_matrix, function_value, Tuple(arguments)))
+        push!(dynamic_terms, (dynamic_matrix, function_value, arguments_tuple))
     end
     return Hamiltonian{dtype}(
         selected_basis,
@@ -234,7 +328,7 @@ function _matrix_at(H::Hamiltonian, time)
     isempty(H.dynamic_terms) && return H.data
     result = copy(H.data)
     for (matrix, function_value, arguments) in H.dynamic_terms
-        result .+= function_value(time, arguments...) .* matrix
+        result = result + function_value(time, arguments...) * matrix
     end
     return result
 end
@@ -243,7 +337,7 @@ Base.size(H::Hamiltonian) = size(H.data)
 Base.size(H::Hamiltonian, dimension::Integer) = size(H.data, dimension)
 Base.eltype(H::Hamiltonian) = eltype(H.data)
 Base.getindex(H::Hamiltonian, indices...) = getindex(H.data, indices...)
-Base.Matrix(H::Hamiltonian) = copy(H.data)
+Base.Matrix(H::Hamiltonian) = Matrix(H.data)
 Base.:*(H::Hamiltonian, vector::AbstractVecOrMat) = H.data * vector
 LinearAlgebra.ishermitian(H::Hamiltonian) = ishermitian(H.data)
 
@@ -253,8 +347,15 @@ function Base.getproperty(H::Hamiltonian, name::Symbol)
     name === :Ns && return size(getfield(H, :data), 1)
     name === :dtype && return eltype(getfield(H, :data))
     name === :get_shape && return size(getfield(H, :data))
-    name === :is_dense && return true
-    name === :nbytes && return Base.summarysize(getfield(H, :data))
+    name === :is_dense && return (
+        getfield(H, :data) isa Matrix ||
+        any(first(term) isa Matrix for term in getfield(H, :dynamic_terms))
+    )
+    name === :nbytes && return Base.summarysize(getfield(H, :data)) +
+        sum(
+            (Base.summarysize(first(term)) for term in getfield(H, :dynamic_terms));
+            init=0,
+        )
     name === :ndim && return 2
     name === :shape && return size(getfield(H, :data))
     name === :static && return copy(getfield(H, :data))
@@ -263,14 +364,28 @@ function Base.getproperty(H::Hamiltonian, name::Symbol)
 end
 
 function LinearAlgebra.eigvals(H::Hamiltonian)
-    return ishermitian(H) ? eigvals(Hermitian(H.data)) : eigvals(H.data)
+    matrix = Matrix(H.data)
+    return ishermitian(H) ? eigvals(Hermitian(matrix)) : eigvals(matrix)
 end
 
 function _transform_hamiltonian(H::Hamiltonian, transform, function_transform=identity)
-    static_matrix = Matrix(transform(H.data))
+    transformed_static = transform(H.data)
+    static_matrix = _matrix_with_format(
+        transformed_static,
+        eltype(transformed_static),
+        _storage_format(H.data),
+    )
     T = eltype(static_matrix)
-    dynamic = Tuple{Matrix{T},Any,Tuple}[
-        (Matrix{T}(transform(matrix)), function_transform(function_value), arguments)
+    dynamic = Tuple{NativeMatrix{T},Any,Tuple}[
+        (
+            _matrix_with_format(
+                transform(matrix),
+                T,
+                _storage_format(matrix),
+            ),
+            function_transform(function_value),
+            arguments,
+        )
         for (matrix, function_value, arguments) in H.dynamic_terms
     ]
     return Hamiltonian{T}(H.basis, copy(H.terms), static_matrix, dynamic)
@@ -290,8 +405,69 @@ Base.adjoint(H::Hamiltonian) = _transform_hamiltonian(
 )
 ishamiltonian(value) = value isa Hamiltonian
 
-as_dense_format(H::Hamiltonian; copy::Bool=false) = copy ? Base.copy(H) : H
-as_sparse_format(H::Hamiltonian; time=0, kwargs...) = sparse(_matrix_at(H, time))
+function _hamiltonian_with_formats(
+    H::Hamiltonian,
+    static_fmt,
+    dynamic_fmt;
+    copy::Bool=false,
+)
+    static_format = _normalize_matrix_format(static_fmt)
+    dynamic_default = dynamic_fmt isa AbstractDict || dynamic_fmt === nothing ?
+        static_format :
+        _normalize_matrix_format(dynamic_fmt; default=static_format)
+    unchanged = _storage_format(H.data) === static_format
+    converted_dynamic = Tuple{NativeMatrix{eltype(H)},Any,Tuple}[]
+    for (matrix, function_value, arguments) in H.dynamic_terms
+        entry_format = if dynamic_fmt isa AbstractDict
+            requested = get(
+                dynamic_fmt,
+                (function_value, arguments),
+                get(dynamic_fmt, function_value, dynamic_default),
+            )
+            _normalize_matrix_format(requested; default=dynamic_default)
+        else
+            dynamic_default
+        end
+        unchanged &= _storage_format(matrix) === entry_format
+        push!(
+            converted_dynamic,
+            (
+                _matrix_with_format(
+                    matrix,
+                    eltype(H),
+                    entry_format;
+                    copy_data=copy,
+                ),
+                function_value,
+                arguments,
+            ),
+        )
+    end
+    unchanged && !copy && return H
+    static_matrix = _matrix_with_format(
+        H.data,
+        eltype(H),
+        static_format;
+        copy_data=copy,
+    )
+    return Hamiltonian{eltype(H)}(
+        H.basis,
+        Base.copy(H.terms),
+        static_matrix,
+        converted_dynamic,
+    )
+end
+
+as_dense_format(H::Hamiltonian; copy::Bool=false) =
+    _hamiltonian_with_formats(H, :dense, :dense; copy)
+function as_sparse_format(
+    H::Hamiltonian;
+    static_fmt=:csc,
+    dynamic_fmt=nothing,
+    copy::Bool=false,
+)
+    return _hamiltonian_with_formats(H, static_fmt, dynamic_fmt; copy)
+end
 aslinearoperator(H::Hamiltonian; time=0) =
     isempty(H.dynamic_terms) && iszero(time) ? H : _matrix_at(H, time)
 check_is_dense(H::Hamiltonian) = H.is_dense
@@ -301,18 +477,30 @@ function astype(
     copy::Bool=false,
     kwargs...,
 ) where {T<:Number}
-    dynamic = Tuple{Matrix{T},Any,Tuple}[
-        (Matrix{T}(matrix), function_value, arguments)
+    dynamic = Tuple{NativeMatrix{T},Any,Tuple}[
+        (
+            _matrix_with_format(matrix, T, _storage_format(matrix)),
+            function_value,
+            arguments,
+        )
         for (matrix, function_value, arguments) in H.dynamic_terms
     ]
-    return Hamiltonian{T}(H.basis, Base.copy(H.terms), Matrix{T}(H.data), dynamic)
+    static_matrix = _matrix_with_format(H.data, T, _storage_format(H.data))
+    return Hamiltonian{T}(H.basis, Base.copy(H.terms), static_matrix, dynamic)
 end
 diagonal(H::Hamiltonian; time=0) = diag(_matrix_at(H, time))
 toarray(H::Hamiltonian; time=0, order=nothing, out=nothing) =
-    _copy_or_write(_matrix_at(H, time), out)
+    _copy_or_write(Matrix(_matrix_at(H, time)), out)
 todense(H::Hamiltonian; kwargs...) = toarray(H; kwargs...)
-tocsc(H::Hamiltonian; time=0) = sparse(_matrix_at(H, time))
-tocsr(H::Hamiltonian; time=0) = sparse(_matrix_at(H, time))
+tocsc(H::Hamiltonian; time=0) = SparseMatrixCSC(_matrix_at(H, time))
+function tocsr(H::Hamiltonian; time=0)
+    throw(
+        ArgumentError(
+            "CSR storage is not provided by Julia's SparseArrays stdlib; " *
+            "use tocsc(H; time) for native sparse storage",
+        ),
+    )
+end
 
 function _copy_or_write(value, out)
     out === nothing && return copy(value)
@@ -358,7 +546,7 @@ function right_apply(
 end
 
 function eigh(H::Hamiltonian; time=0, kwargs...)
-    matrix = _matrix_at(H, time)
+    matrix = Matrix(_matrix_at(H, time))
     decomposition = ishermitian(matrix) ?
         eigen(Hermitian(matrix)) :
         eigen(matrix)
@@ -370,20 +558,56 @@ function eigsh(
     time=0,
     k::Integer=min(6, size(H, 1)),
     which=:SA,
+    return_eigenvectors::Bool=true,
     kwargs...,
 )
-    values, vectors = eigh(H; time)
-    1 <= k <= length(values) || throw(ArgumentError("k must lie in 1:Ns"))
-    indices = which in (:SA, "SA") ?
-        sortperm(real.(values))[1:k] :
-        which in (:LA, "LA") ?
-        sortperm(real.(values); rev=true)[1:k] :
-        which in (:SM, "SM") ?
-        sortperm(abs.(values))[1:k] :
-        which in (:LM, "LM") ?
-        sortperm(abs.(values); rev=true)[1:k] :
-        throw(ArgumentError("which must be SA, LA, SM, or LM"))
-    return values[indices], vectors[:, indices]
+    matrix = _matrix_at(H, time)
+    n = size(matrix, 1)
+    1 <= k <= n || throw(ArgumentError("k must lie in 1:Ns"))
+    requested = Symbol(uppercase(String(which)))
+    requested in (:SA, :LA, :SM, :LM, :BE) ||
+        throw(ArgumentError("which must be SA, LA, SM, LM, or BE"))
+    if k >= n - 1
+        values, vectors = eigh(H; time)
+        indices = requested === :SA ?
+            sortperm(real.(values))[1:k] :
+            requested === :LA ?
+            sortperm(real.(values); rev=true)[1:k] :
+            requested === :SM ?
+            sortperm(abs.(values))[1:k] :
+            requested === :LM ?
+            sortperm(abs.(values); rev=true)[1:k] :
+            vcat(
+                sortperm(real.(values))[1:fld(k, 2)],
+                sortperm(real.(values); rev=true)[1:cld(k, 2)],
+            )
+        selected_values = values[indices]
+        return return_eigenvectors ?
+            (selected_values, vectors[:, indices]) :
+            selected_values
+    end
+    arpack_which = requested === :SA ? :SR : requested === :LA ? :LR : requested
+    target = ishermitian(matrix) ? Hermitian(matrix) : matrix
+    values, vectors, _, _, _, _ = Arpack.eigs(
+        target;
+        nev=k,
+        which=arpack_which,
+        kwargs...,
+    )
+    order = requested === :SA ?
+        sortperm(real.(values)) :
+        requested === :LA ?
+        sortperm(real.(values); rev=true) :
+        requested === :SM ?
+        sortperm(abs.(values)) :
+        requested === :LM ?
+        sortperm(abs.(values); rev=true) :
+        eachindex(values)
+    ordered_values = values[order]
+    ishermitian(matrix) && (ordered_values = real.(ordered_values))
+    return return_eigenvectors ?
+        (ordered_values, vectors[:, order]) :
+        ordered_values
 end
 
 function evolve(
@@ -523,7 +747,22 @@ function rotate_by(H::Hamiltonian, other; generator::Bool=false, kwargs...)
 end
 
 LinearAlgebra.tr(H::Hamiltonian) = tr(H.data)
-update_matrix_formats!(H::Hamiltonian, args...; kwargs...) = H
+function update_matrix_formats!(
+    H::Hamiltonian,
+    static_fmt,
+    dynamic_fmt=nothing,
+)
+    converted = _hamiltonian_with_formats(
+        H,
+        static_fmt,
+        dynamic_fmt;
+        copy=false,
+    )
+    converted === H && return H
+    H.data = converted.data
+    H.dynamic_terms = converted.dynamic_terms
+    return H
+end
 
 """
     QuantumLinearOperator(basis, static_list; diagonal=nothing)
@@ -685,9 +924,9 @@ end
 Parameter-dependent operator `sum(pars[key] * input_dict[key])`. Dictionary
 values may be native `OperatorTerm` vectors or square matrices.
 """
-struct QuantumOperator{T<:Number}
+mutable struct QuantumOperator{T<:Number}
     basis::SpinBasis1D
-    components::Dict{Any,Matrix{T}}
+    components::Dict{Any,NativeMatrix{T}}
 end
 
 """
@@ -740,25 +979,43 @@ end
 function QuantumOperator(
     basis::SpinBasis1D,
     input_dict::AbstractDict,
+    ;
+    matrix_formats::AbstractDict=Dict(),
 )
     isempty(input_dict) && throw(ArgumentError("input_dict must be nonempty"))
     raw = Dict{Any,Any}()
+    raw_formats = Dict{Any,Symbol}()
     types = Type[]
     for (key, value) in input_dict
+        requested_format = haskey(matrix_formats, key) ?
+            matrix_formats[key] :
+            value isa SparseMatrixCSC ? :csc : :dense
         matrix = if value isa AbstractMatrix
-            Matrix(value)
+            value
         elseif value isa AbstractVector{<:OperatorTerm}
-            Matrix(Hamiltonian(basis, value))
+            Hamiltonian(
+                basis,
+                value;
+                static_fmt=requested_format,
+            ).data
         else
             throw(ArgumentError("operator components must be matrices or OperatorTerm vectors"))
         end
         size(matrix) == (length(basis), length(basis)) ||
             throw(DimensionMismatch("every component must have shape (Ns,Ns)"))
         raw[key] = matrix
+        raw_formats[key] = _normalize_matrix_format(requested_format)
         push!(types, eltype(matrix))
     end
     T = promote_type(types...)
-    components = Dict(key => Matrix{T}(value) for (key, value) in raw)
+    components = Dict{Any,NativeMatrix{T}}(
+        key => _matrix_with_format(
+            value,
+            T,
+            raw_formats[key],
+        )
+        for (key, value) in raw
+    )
     return QuantumOperator{T}(basis, components)
 end
 
@@ -767,9 +1024,11 @@ function _parameter_matrix(operator::QuantumOperator, pars::AbstractDict=Dict())
         eltype(first(values(operator.components))),
         (typeof(value) for value in values(pars))...,
     )
-    result = zeros(T, size(operator)...)
+    result = all(value isa SparseMatrixCSC for value in values(operator.components)) ?
+        spzeros(T, size(operator)...) :
+        zeros(T, size(operator)...)
     for (key, matrix) in operator.components
-        result .+= get(pars, key, zero(T)) .* matrix
+        result = result + get(pars, key, zero(T)) * matrix
     end
     return result
 end
@@ -785,7 +1044,8 @@ function Base.getproperty(operator::QuantumOperator, name::Symbol)
     name === :Ns && return size(first(values(getfield(operator, :components))), 1)
     name === :dtype && return eltype(first(values(getfield(operator, :components))))
     name === :get_shape && return size(first(values(getfield(operator, :components))))
-    name === :is_dense && return true
+    name === :is_dense &&
+        return any(value isa Matrix for value in values(getfield(operator, :components)))
     name === :ndim && return 2
     name === :shape && return size(first(values(getfield(operator, :components))))
     return getfield(operator, name)
@@ -795,7 +1055,14 @@ function _quantum_operator_from_components(source::QuantumOperator, components)
     T = promote_type((eltype(value) for value in values(components))...)
     return QuantumOperator{T}(
         source.basis,
-        Dict(key => Matrix{T}(value) for (key, value) in components),
+        Dict{Any,NativeMatrix{T}}(
+            key => _matrix_with_format(
+                value,
+                T,
+                _storage_format(source.components[key]),
+            )
+            for (key, value) in components
+        ),
     )
 end
 
@@ -824,17 +1091,26 @@ function astype(
 ) where {T<:Number}
     return QuantumOperator{T}(
         operator.basis,
-        Dict(key => Matrix{T}(value) for (key, value) in operator.components),
+        Dict{Any,NativeMatrix{T}}(
+            key => _matrix_with_format(value, T, _storage_format(value))
+            for (key, value) in operator.components
+        ),
     )
 end
 
 toarray(operator::QuantumOperator; pars::AbstractDict=Dict(), out=nothing) =
-    _copy_or_write(_parameter_matrix(operator, pars), out)
+    _copy_or_write(Matrix(_parameter_matrix(operator, pars)), out)
 todense(operator::QuantumOperator; kwargs...) = toarray(operator; kwargs...)
 tocsc(operator::QuantumOperator; pars::AbstractDict=Dict()) =
     sparse(_parameter_matrix(operator, pars))
-tocsr(operator::QuantumOperator; pars::AbstractDict=Dict()) =
-    sparse(_parameter_matrix(operator, pars))
+function tocsr(operator::QuantumOperator; pars::AbstractDict=Dict())
+    throw(
+        ArgumentError(
+            "CSR storage is not provided by Julia's SparseArrays stdlib; " *
+            "use tocsc(operator; pars) for native sparse storage",
+        ),
+    )
+end
 diagonal(operator::QuantumOperator; pars::AbstractDict=Dict()) =
     diag(_parameter_matrix(operator, pars))
 LinearAlgebra.tr(operator::QuantumOperator; pars::AbstractDict=Dict()) =
@@ -874,7 +1150,7 @@ function right_apply(
 end
 
 function eigh(operator::QuantumOperator; pars::AbstractDict=Dict(), kwargs...)
-    matrix = _parameter_matrix(operator, pars)
+    matrix = Matrix(_parameter_matrix(operator, pars))
     decomposition = ishermitian(matrix) ?
         eigen(Hermitian(matrix)) :
         eigen(matrix)
@@ -971,7 +1247,22 @@ function quant_fluct(
     )
 end
 
-update_matrix_formats!(operator::QuantumOperator, args...; kwargs...) = operator
+function update_matrix_formats!(
+    operator::QuantumOperator,
+    matrix_formats::AbstractDict,
+)
+    for (key, requested) in matrix_formats
+        haskey(operator.components, key) ||
+            throw(KeyError(key))
+        operator.components[key] = _matrix_with_format(
+            operator.components[key],
+            eltype(operator),
+            requested,
+            copy_data=false,
+        )
+    end
+    return operator
+end
 
 _operator_matrix(operator::Hamiltonian) = operator.data
 _operator_matrix(operator::AbstractMatrix) = operator

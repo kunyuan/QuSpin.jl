@@ -2,7 +2,7 @@ module Tools
 
 using LinearAlgebra
 using ..Basis: AbstractBasis, FixedUInt, get_basis_type, projection_matrix
-using ..Operators: Hamiltonian, OperatorTerm
+using ..Operators: Hamiltonian, OperatorTerm, toarray
 import ..Basis: ent_entropy
 import ..Operators: apply, evolve, set_a!
 
@@ -763,7 +763,10 @@ _dict_get(dictionary::AbstractDict, key::Symbol, default=nothing) =
     get(dictionary, key, get(dictionary, String(key), default))
 _dict_has(dictionary::AbstractDict, key::Symbol) =
     haskey(dictionary, key) || haskey(dictionary, String(key))
-_floquet_matrix(H, time=0.0) = Matrix{ComplexF64}(H isa Function ? H(time) : H)
+_floquet_matrix(H::Hamiltonian, time=0.0) =
+    Matrix{ComplexF64}(toarray(H; time))
+_floquet_matrix(H, time=0.0) =
+    Matrix{ComplexF64}(H isa Function ? H(time) : H)
 
 function _step_unitary(matrices, durations)
     length(matrices) == length(durations) ||
