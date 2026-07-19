@@ -1,171 +1,177 @@
 module QuSpin
 
 using LinearAlgebra
+using SparseArrays
 
-export Hamiltonian, OperatorTerm, SpinBasis1D
+include("basis.jl")
+include("operators.jl")
+include("tools.jl")
+
+using .Basis:
+    AbstractBasis,
+    BosonBasis1D,
+    BosonBasisGeneral,
+    FixedUInt,
+    PhotonBasis,
+    SpinBasis1D,
+    SpinBasisGeneral,
+    SpinfulFermionBasis1D,
+    SpinfulFermionBasisGeneral,
+    SpinlessFermionBasis1D,
+    SpinlessFermionBasisGeneral,
+    TensorBasis,
+    UserBasis,
+    UInt256,
+    UInt1024,
+    UInt4096,
+    UInt16384,
+    basis_int_to_python_int,
+    basis_ones,
+    basis_zeros,
+    bitwise_and,
+    bitwise_leftshift,
+    bitwise_not,
+    bitwise_or,
+    bitwise_rightshift,
+    bitwise_xor,
+    coherent_state,
+    ent_entropy,
+    expanded_form,
+    get_vec,
+    get_basis_type,
+    photon_Hspace_dim,
+    projection_matrix,
+    project_from,
+    partial_trace,
+    python_int_to_basis_int,
+    int_to_state,
+    check_hermitian,
+    check_pcon,
+    check_symm,
+    get_amp,
+    inplace_op!,
+    make_basis!,
+    make_basis_blocks,
+    normalization,
+    op_bra_ket,
+    op_shift_sector,
+    operator_matrix,
+    representative,
+    state_to_int,
+    state_at,
+    state_index,
+    states
+using .Operators:
+    ExpOp,
+    Hamiltonian,
+    OperatorTerm,
+    QuantumLinearOperator,
+    QuantumOperator,
+    anti_commutator,
+    as_dense_format,
+    aslinearoperator,
+    as_sparse_format,
+    apply,
+    astype,
+    commutator,
+    check_is_dense,
+    diagonal,
+    eigh,
+    eigsh,
+    evolve,
+    expt_value,
+    get_mat,
+    get_operators,
+    isexp_op,
+    ishamiltonian,
+    isquantum_LinearOperator,
+    isquantum_operator,
+    load_zip,
+    matrix_ele,
+    project_to,
+    quant_fluct,
+    right_apply,
+    rotate_by,
+    sandwich,
+    save_zip,
+    set_a!,
+    set_grid!,
+    set_iterate!,
+    set_diagonal!,
+    unset_grid!,
+    toarray,
+    tohamiltonian,
+    tocsc,
+    tocsr,
+    todense,
+    update_matrix_formats!
+using .Tools:
+    ExpmMultiplyParallel,
+    BlockOps,
+    Floquet,
+    FloquetTimeVector,
+    ftlm_static_iteration,
+    ltlm_static_iteration,
+    ed_state_vs_time,
+    diag_ensemble,
+    expm_lanczos,
+    array_to_ints,
+    block_diag_hamiltonian,
+    block_expm,
+    compute_all_blocks!,
+    get_matvec_function,
+    get_coordinates,
+    ints_to_array,
+    kl_div,
+    lanczos_full,
+    lanczos_iter,
+    lin_comb_Q_T,
+    matvec,
+    mean_level_spacing,
+    obs_vs_time,
+    project_op,
+    update_blocks!,
+    expm_multiply_parallel
+
+export Basis, Operators, Tools
+export AbstractBasis, ExpOp, FixedUInt, Hamiltonian, OperatorTerm
+export BosonBasis1D, BosonBasisGeneral
+export PhotonBasis, TensorBasis
+export UserBasis
+export SpinfulFermionBasis1D, SpinfulFermionBasisGeneral
+export SpinlessFermionBasis1D, SpinlessFermionBasisGeneral
+export ExpmMultiplyParallel, expm_multiply_parallel
+export BlockOps, block_diag_hamiltonian, block_expm
+export compute_all_blocks!, update_blocks!
+export Floquet, FloquetTimeVector, get_coordinates
+export QuantumLinearOperator, QuantumOperator, SpinBasis1D
+export SpinBasisGeneral
+export load_zip, save_zip
+export UInt256, UInt1024, UInt4096, UInt16384
+export basis_int_to_python_int, basis_ones, basis_zeros
+export bitwise_and, bitwise_leftshift, bitwise_not, bitwise_or
+export bitwise_rightshift, bitwise_xor
+export coherent_state, get_basis_type, photon_Hspace_dim
+export ent_entropy, partial_trace, projection_matrix, python_int_to_basis_int
+export expanded_form, get_vec, project_from
+export check_hermitian, check_pcon, check_symm, get_amp, inplace_op!
+export make_basis!, make_basis_blocks, normalization
+export op_bra_ket, op_shift_sector, operator_matrix, representative
+export anti_commutator, commutator
+export apply, get_mat, isexp_op, right_apply, sandwich
+export set_a!, set_grid!, set_iterate!, unset_grid!
+export as_dense_format, as_sparse_format, astype, diagonal, eigh, eigsh
+export aslinearoperator, check_is_dense
+export evolve, expt_value, ishamiltonian, matrix_ele, project_to, quant_fluct
+export isquantum_LinearOperator, set_diagonal!
+export get_operators, isquantum_operator, tohamiltonian
+export rotate_by, toarray, tocsc, tocsr, todense, update_matrix_formats!
+export array_to_ints, get_matvec_function, ints_to_array, kl_div, matvec
+export mean_level_spacing, project_op
+export diag_ensemble, obs_vs_time
+export ed_state_vs_time, expm_lanczos, lanczos_full, lanczos_iter, lin_comb_Q_T
+export ftlm_static_iteration, ltlm_static_iteration
 export eigvals, state_at, state_index, states
-
-"""
-    SpinBasis1D(L; nup=nothing, pauli=true)
-
-Computational basis for a spin-one-half chain. Public site indices are
-one-based; basis states use the low `L` bits of a `UInt64`.
-"""
-struct SpinBasis1D
-    L::Int
-    nup::Union{Nothing,Int}
-    pauli::Bool
-    encoded_states::Vector{UInt64}
-    lookup::Dict{UInt64,Int}
-end
-
-function SpinBasis1D(
-    L::Integer;
-    nup::Union{Nothing,Integer}=nothing,
-    pauli::Bool=true,
-)
-    1 <= L <= 63 || throw(ArgumentError("L must be between 1 and 63"))
-    nup === nothing || 0 <= nup <= L ||
-        throw(ArgumentError("nup must lie between 0 and L"))
-
-    wanted = nup === nothing ? nothing : Int(nup)
-    encoded = UInt64[]
-    sizehint!(encoded, wanted === nothing ? 1 << min(Int(L), 20) : 0)
-    last_state = (UInt64(1) << Int(L)) - UInt64(1)
-    for state in UInt64(0):last_state
-        wanted === nothing || count_ones(state) == wanted || continue
-        push!(encoded, state)
-    end
-    lookup = Dict(state => i for (i, state) in pairs(encoded))
-    return SpinBasis1D(Int(L), wanted, pauli, encoded, lookup)
-end
-
-Base.length(basis::SpinBasis1D) = length(basis.encoded_states)
-states(basis::SpinBasis1D) = copy(basis.encoded_states)
-
-function state_index(basis::SpinBasis1D, state::Integer)
-    state < 0 && throw(ArgumentError("state must be nonnegative"))
-    encoded = UInt64(state)
-    return get(basis.lookup, encoded) do
-        throw(ArgumentError("state $state is not represented by this basis"))
-    end
-end
-
-function state_at(basis::SpinBasis1D, index::Integer)
-    checkbounds(basis.encoded_states, index)
-    return basis.encoded_states[index]
-end
-
-"""
-    OperatorTerm(op, couplings)
-
-A local spin operator. Each coupling is a tuple whose first element is the
-coefficient and whose remaining elements are one-based lattice sites.
-"""
-struct OperatorTerm{C<:AbstractVector}
-    op::String
-    couplings::C
-end
-
-function OperatorTerm(op::AbstractString, couplings::AbstractVector)
-    isempty(op) && throw(ArgumentError("operator string cannot be empty"))
-    normalized = map(c -> Tuple(c), couplings)
-    for coupling in normalized
-        length(coupling) == length(op) + 1 ||
-            throw(ArgumentError("operator arity and coupling sites differ"))
-        all(site -> site isa Integer, coupling[2:end]) ||
-            throw(ArgumentError("all sites must be integers"))
-    end
-    return OperatorTerm(String(op), normalized)
-end
-
-"""
-    Hamiltonian(basis, terms)
-
-Many-body operator assembled in the enumeration of `basis`.
-"""
-struct Hamiltonian{T<:Number}
-    basis::SpinBasis1D
-    terms::Vector{OperatorTerm}
-    data::Matrix{T}
-end
-
-function _coefficient_type(terms)
-    coefficient_types = Type[]
-    for term in terms, coupling in term.couplings
-        push!(coefficient_types, typeof(first(coupling)))
-    end
-    isempty(coefficient_types) && return Float64
-    return promote_type(Float64, coefficient_types...)
-end
-
-@inline function _site_mask(basis::SpinBasis1D, site::Integer)
-    1 <= site <= basis.L ||
-        throw(ArgumentError("site $site lies outside 1:$(basis.L)"))
-    return UInt64(1) << (Int(site) - 1)
-end
-
-function _apply_local(
-    basis::SpinBasis1D,
-    state::UInt64,
-    op::Char,
-    site::Integer,
-)
-    mask = _site_mask(basis, site)
-    occupied = !iszero(state & mask)
-    if op == 'I'
-        return state, 1.0, true
-    elseif op == 'z'
-        scale = basis.pauli ? 1.0 : 0.5
-        return state, occupied ? scale : -scale, true
-    elseif op == '+'
-        occupied && return state, 0.0, false
-        scale = basis.pauli ? 2.0 : 1.0
-        return state | mask, scale, true
-    elseif op == '-'
-        occupied || return state, 0.0, false
-        scale = basis.pauli ? 2.0 : 1.0
-        return state & ~mask, scale, true
-    else
-        throw(ArgumentError("unsupported spin operator '$op'"))
-    end
-end
-
-function _assemble(basis::SpinBasis1D, terms::Vector{OperatorTerm}, ::Type{T}) where {T}
-    matrix = zeros(T, length(basis), length(basis))
-    for (column, initial_state) in pairs(basis.encoded_states)
-        for term in terms, coupling in term.couplings
-            amplitude = convert(T, first(coupling))
-            state = initial_state
-            alive = true
-            for (op, site) in zip(term.op, coupling[2:end])
-                state, factor, alive = _apply_local(basis, state, op, site)
-                alive || break
-                amplitude *= factor
-            end
-            alive || continue
-            row = get(basis.lookup, state, 0)
-            iszero(row) && continue
-            matrix[row, column] += amplitude
-        end
-    end
-    return matrix
-end
-
-function Hamiltonian(basis::SpinBasis1D, terms::AbstractVector{<:OperatorTerm})
-    normalized = OperatorTerm[terms...]
-    T = _coefficient_type(normalized)
-    return Hamiltonian{T}(basis, normalized, _assemble(basis, normalized, T))
-end
-
-Base.size(H::Hamiltonian) = size(H.data)
-Base.getindex(H::Hamiltonian, indices...) = getindex(H.data, indices...)
-Base.Matrix(H::Hamiltonian) = copy(H.data)
-Base.:*(H::Hamiltonian, vector::AbstractVecOrMat) = H.data * vector
-LinearAlgebra.ishermitian(H::Hamiltonian) = ishermitian(H.data)
-
-function LinearAlgebra.eigvals(H::Hamiltonian)
-    return ishermitian(H) ? eigvals(Hermitian(H.data)) : eigvals(H.data)
-end
+export int_to_state, state_to_int
 
 end
