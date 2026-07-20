@@ -1154,17 +1154,30 @@ function _discrete_operator_triplets(
 )
     rows = Int[]
     columns = Int[]
-    values = ComplexF64[]
+    coefficient_type = isempty(couplings) ?
+        Float64 :
+        promote_type(
+            Float64,
+            (typeof(first(coupling)) for coupling in couplings)...,
+        )
+    values = coefficient_type[]
     weights = UInt64[
         UInt64(basis.sps)^(site - 1) for site in 1:basis.L
     ]
+    diagonal_operator = all(
+        operator -> operator in ('I', 'n', 'z', '|'),
+        opstring,
+    )
+    diagonal = diagonal_operator ?
+        zeros(coefficient_type, length(basis)) :
+        coefficient_type[]
     for coupling in couplings
-        coefficient = first(coupling)
+        coefficient = convert(coefficient_type, first(coupling))
         sites = coupling[2:end]
         actions = _operator_actions(basis, opstring, sites)
         for column in eachindex(basis.encoded_states)
             encoded = basis.encoded_states[column]
-            amplitude = complex(coefficient)
+            amplitude = coefficient
             alive = true
             for (op, site, species) in Iterators.reverse(actions)
                 encoded, factor, alive = _apply_discrete_encoded_local(
@@ -1182,9 +1195,22 @@ function _discrete_operator_triplets(
             alive || continue
             row = get(basis.lookup, encoded, 0)
             row == 0 && continue
-            push!(rows, row)
-            push!(columns, column)
-            push!(values, amplitude)
+            if diagonal_operator
+                row == column || error("diagonal operator changed basis state")
+                diagonal[column] += amplitude
+            else
+                push!(rows, row)
+                push!(columns, column)
+                push!(values, amplitude)
+            end
+        end
+    end
+    if diagonal_operator
+        for index in eachindex(diagonal)
+            iszero(diagonal[index]) && continue
+            push!(rows, index)
+            push!(columns, index)
+            push!(values, diagonal[index])
         end
     end
     return rows, columns, values

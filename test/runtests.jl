@@ -687,6 +687,38 @@ end
     @test eigsh(H; k=2, which=:SA, return_eigenvectors=false) ≈
         values[1:2] atol=2e-13
 
+    # This nonsingular symmetric matrix has a zero first LDLt pivot.
+    # Shift-invert therefore needs a pivoted factorization.
+    pivot_basis = SpinBasis1D(2)
+    pivot_H = Hamiltonian(
+        pivot_basis,
+        [OperatorTerm("x", [(1.0, 1)])];
+        static_fmt=:csc,
+    )
+    pivot_values, pivot_vectors = eigsh(
+        pivot_H;
+        k=1,
+        sigma=0.0,
+        which=:LM,
+        v0=fill(0.5, length(pivot_basis)),
+        tol=1e-12,
+    )
+    @test abs(pivot_values[1]) ≈ 1.0 atol=2e-13
+    @test norm(
+        Matrix(pivot_H) * pivot_vectors -
+        pivot_vectors * Diagonal(pivot_values),
+    ) < 2e-12
+    pivot_values_only = eigsh(
+        pivot_H;
+        k=1,
+        sigma=0.0,
+        which=:LM,
+        return_eigenvectors=false,
+        v0=fill(0.5, length(pivot_basis)),
+        tol=1e-12,
+    )
+    @test abs(pivot_values_only[1]) ≈ 1.0 atol=2e-13
+
     normalized = vector / norm(vector)
     @test expt_value(H, normalized) ≈ dot(normalized, matrix * normalized)
     @test matrix_ele(H, normalized, normalized) ≈ expt_value(H, normalized)
