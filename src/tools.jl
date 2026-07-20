@@ -2,7 +2,12 @@ module Tools
 
 using LinearAlgebra
 using ..Basis: AbstractBasis, FixedUInt, get_basis_type, projection_matrix
-using ..Operators: Hamiltonian, OperatorTerm, _krylov_expmv, toarray
+using ..Operators:
+    Hamiltonian,
+    OperatorTerm,
+    _krylov_expmv,
+    _krylov_expmv_times,
+    toarray
 import ..Basis: ent_entropy
 import ..Operators: apply, evolve, set_a!
 
@@ -83,11 +88,26 @@ function ints_to_array(basis_ints, N::Union{Nothing,Integer}=nothing)
     end
     width >= 0 || throw(ArgumentError("N must be nonnegative"))
     result = Matrix{UInt8}(undef, length(values), width)
-    for (row, value) in pairs(values)
-        encoded = BigInt(value)
-        encoded >= 0 || throw(ArgumentError("basis integers must be nonnegative"))
-        for column in 1:width
-            result[row, column] = UInt8((encoded >> (width - column)) & 1)
+    T = eltype(values)
+    if T <: Union{Base.BitInteger,FixedUInt}
+        for (row, encoded) in pairs(values)
+            !isless(encoded, zero(encoded)) ||
+                throw(ArgumentError("basis integers must be nonnegative"))
+            for column in 1:width
+                bit =
+                    (encoded >> (width - column)) & one(encoded)
+                result[row, column] = iszero(bit) ? 0x00 : 0x01
+            end
+        end
+    else
+        for (row, value) in pairs(values)
+            encoded = BigInt(value)
+            encoded >= 0 ||
+                throw(ArgumentError("basis integers must be nonnegative"))
+            for column in 1:width
+                result[row, column] =
+                    UInt8((encoded >> (width - column)) & 1)
+            end
         end
     end
     return result
@@ -106,12 +126,25 @@ function array_to_ints(state_array, dtype::Union{Nothing,Type}=nothing)
         throw(ArgumentError("state_array entries must be binary"))
     T = dtype === nothing ? get_basis_type(size(states, 2), nothing, 2) : dtype
     result = Vector{T}(undef, size(states, 1))
-    for row in axes(states, 1)
-        value = BigInt(0)
-        for bit in @view states[row, :]
-            value = (value << 1) | Int(bit)
+    native_path =
+        T <: Union{Unsigned,FixedUInt} &&
+        size(states, 2) <= _integer_width(T)
+    if native_path
+        for row in axes(states, 1)
+            value = zero(T)
+            for bit in @view states[row, :]
+                value = (value << 1) | T(bit)
+            end
+            result[row] = value
         end
-        result[row] = T(value)
+    else
+        for row in axes(states, 1)
+            value = BigInt(0)
+            for bit in @view states[row, :]
+                value = (value << 1) | Int(bit)
+            end
+            result[row] = T(value)
+        end
     end
     return result
 end
@@ -129,7 +162,25 @@ function matvec(
     out=nothing,
     a::Number=1,
 )
-    result = a * (array * other)
+    if out !== nothing &&
+       applicable(
+        mul!,
+        out,
+        array,
+        other,
+        a,
+        overwrite_out ? zero(a) : one(a),
+    )
+        mul!(
+            out,
+            array,
+            other,
+            a,
+            overwrite_out ? zero(a) : one(a),
+        )
+        return out
+    end
+    result = a == one(a) ? array * other : a * (array * other)
     out === nothing && return result
     axes(out) == axes(result) ||
         throw(DimensionMismatch("out and matrix-vector result must have the same axes"))
@@ -142,6 +193,18 @@ function matvec(
 end
 
 get_matvec_function(array) = matvec
+
+function _trace_product(left::AbstractMatrix, right::AbstractMatrix)
+    size(left, 2) == size(right, 1) &&
+        size(left, 1) == size(right, 2) ||
+        throw(DimensionMismatch("trace product requires transposed dimensions"))
+    T = promote_type(eltype(left), eltype(right))
+    result = zero(T)
+    @inbounds for column in axes(left, 2), row in axes(left, 1)
+        result += left[row, column] * right[column, row]
+    end
+    return result
+end
 
 function _projector(proj::AbstractMatrix, ::Type{T}) where {T<:Number}
     return Matrix{T}(proj)
@@ -191,25 +254,31 @@ function ed_state_vs_time(
         length(psi) == length(E) ||
             throw(DimensionMismatch("psi and E dimensions must agree"))
         coefficients = V' * psi
-        result = reduce(
-            hcat,
-            (V * (exp.((-im * time) .* E) .* coefficients) for time in times),
-        )
-        return iterate ? (copy(view(result, :, index)) for index in axes(result, 2)) : result
+        if iterate
+            return (
+                V * (exp.((-im * time) .* E) .* coefficients)
+                for time in times
+            )
+        end
+        time_values = collect(times)
+        weights =
+            exp.((-im .* E) .* transpose(time_values)) .*
+            coefficients
+        return V * weights
     end
 
     size(psi, 1) == size(psi, 2) == length(E) ||
         throw(DimensionMismatch("a mixed state must be square and match E"))
     rho_eigen = V' * psi * V
-    evolved = [
+    evolved = (
         begin
             phases = exp.((-im * time) .* E)
             V * (phases .* rho_eigen .* transpose(conj.(phases))) * V'
         end
         for time in times
-    ]
-    iterate && return (matrix for matrix in evolved)
-    return cat(evolved...; dims=3)
+    )
+    iterate && return evolved
+    return cat(collect(evolved)...; dims=3)
 end
 
 """
@@ -302,7 +371,7 @@ function obs_vs_time(
             results[key] = [
                 begin
                     matrix = _observable_matrix(observable, time_values[index])
-                    tr(@view(states[:, :, index]) * matrix)
+                    _trace_product(@view(states[:, :, index]), matrix)
                 end
                 for index in axes(states, 3)
             ]
@@ -515,6 +584,7 @@ function evolve(
 )
     max_step > 0 || throw(ArgumentError("max_step must be positive"))
     targets = collect(times)
+    isempty(targets) && throw(ArgumentError("times must be nonempty"))
     issorted(targets) || throw(ArgumentError("times must be sorted"))
     state = copy(v0)
     current = float(t0)
@@ -523,6 +593,10 @@ function evolve(
         target >= current ||
             throw(ArgumentError("times must not precede the current integration time"))
         interval = target - current
+        if iszero(interval)
+            push!(outputs, copy(state))
+            continue
+        end
         steps = max(1, ceil(Int, abs(interval) / max_step))
         step = interval / steps
         for _ in 1:steps
@@ -621,6 +695,8 @@ function apply(
     return v
 end
 
+MatrixOrVector(v::AbstractVector{T}, ::Type{T}) where {T} = v
+MatrixOrVector(v::AbstractMatrix{T}, ::Type{T}) where {T} = v
 MatrixOrVector(v::AbstractVector, ::Type{T}) where {T} = Vector{T}(v)
 MatrixOrVector(v::AbstractMatrix, ::Type{T}) where {T} = Matrix{T}(v)
 
@@ -764,8 +840,11 @@ struct Floquet
     thetaF::Union{Nothing,Vector{ComplexF64}}
 end
 
-_dict_get(dictionary::AbstractDict, key::Symbol, default=nothing) =
-    get(dictionary, key, get(dictionary, String(key), default))
+function _dict_get(dictionary::AbstractDict, key::Symbol, default=nothing)
+    haskey(dictionary, key) && return dictionary[key]
+    string_key = String(key)
+    return haskey(dictionary, string_key) ? dictionary[string_key] : default
+end
 _dict_has(dictionary::AbstractDict, key::Symbol) =
     haskey(dictionary, key) || haskey(dictionary, String(key))
 _floquet_matrix(H::Hamiltonian, time=0.0) =
@@ -782,12 +861,10 @@ function _step_unitary(matrices, durations)
         throw(ArgumentError("Hamiltonians must be square"))
     unitary = Matrix{ComplexF64}(I, size(first_matrix)...)
     for (H, duration) in zip(matrices, durations)
-        operator = H isa Hamiltonian && isempty(H.dynamic_terms) ?
-            H :
-            _floquet_matrix(H)
-        size(operator) == size(first_matrix) ||
+        matrix = _floquet_matrix(H)
+        size(matrix) == size(first_matrix) ||
             throw(DimensionMismatch("all Hamiltonians must have the same shape"))
-        unitary = _krylov_expmv(operator, unitary, -im * duration)
+        unitary = exp((-im * duration) .* matrix) * unitary
     end
     return unitary
 end
@@ -821,26 +898,27 @@ function Floquet(
         T, _step_unitary(matrices, dt_list)
     elseif _dict_has(evolution, :H) && _dict_has(evolution, :T)
         requested_H = _dict_get(evolution, :H)
-        H = requested_H isa Hamiltonian && isempty(requested_H.dynamic_terms) ?
-            requested_H :
-            _floquet_matrix(requested_H)
         T = float(_dict_get(evolution, :T))
-        identity = Matrix{ComplexF64}(I, size(H)...)
-        T, _krylov_expmv(H, identity, -im * T)
+        T, _step_unitary((requested_H,), (T,))
     else
         throw(ArgumentError("unsupported Floquet evolution dictionary"))
     end
     period > 0 || throw(ArgumentError("the Floquet period must be positive"))
 
-    decomposition = eigen(unitary)
-    phases = ComplexF64.(decomposition.values)
-    vectors = ComplexF64.(decomposition.vectors)
+    vectors = nothing
+    phases = if VF || force_ONB
+        decomposition = eigen(unitary)
+        vectors = ComplexF64.(decomposition.vectors)
+        ComplexF64.(decomposition.values)
+    else
+        ComplexF64.(eigvals(unitary))
+    end
     energies = real.((im / period) .* log.(phases))
     order = sortperm(energies)
     energies = Float64.(energies[order])
     phases = phases[order]
-    vectors = vectors[:, order]
-    if force_ONB
+    vectors === nothing || (vectors = vectors[:, order])
+    if force_ONB && vectors !== nothing
         vectors = Matrix(qr(vectors).Q)
     end
 
@@ -1045,13 +1123,13 @@ function evolve(
         projected = projector' * psi_0
         norm(projected) > 1000eps(Float64) || continue
         active = true
-        for (column, time) in pairs(targets)
-            result[:, column] .+= projector * _krylov_expmv(
-                hamiltonian,
-                projected,
-                -im * (time - t0),
-            )
-        end
+        scales = ComplexF64[-im * (time - t0) for time in targets]
+        block_states = _krylov_expmv_times(
+            hamiltonian,
+            projected,
+            scales,
+        )
+        result .+= projector * block_states
     end
     active || throw(ArgumentError("initial state has no projection onto the selected blocks"))
     iterate && return (copy(view(result, :, index)) for index in axes(result, 2))
@@ -1088,13 +1166,12 @@ function block_expm(
         generator = shift === nothing ?
             hamiltonian :
             Matrix(hamiltonian) + shift * I
-        for (column, scale) in pairs(scales)
-            result[:, column] .+= projector * _krylov_expmv(
-                generator,
-                projected,
-                scale * a,
-            )
-        end
+        block_states = _krylov_expmv_times(
+            generator,
+            projected,
+            scales .* a,
+        )
+        result .+= projector * block_states
     end
     output = length(scales) == 1 ? vec(result) : result
     iterate && return (copy(view(result, :, index)) for index in axes(result, 2))
@@ -1125,7 +1202,9 @@ function lanczos_full(
     n = length(v0)
     1 <= m < n ||
         throw(ArgumentError("Lanczos dimension m must satisfy 1 <= m < length(v0)"))
-    norm(v0) > 0 || throw(ArgumentError("initial Lanczos vector must be nonzero"))
+    initial_norm = norm(v0)
+    initial_norm > 0 ||
+        throw(ArgumentError("initial Lanczos vector must be nonzero"))
 
     first_action = _lanczos_action(A, v0)
     T = promote_type(eltype(v0), eltype(first_action))
@@ -1136,7 +1215,7 @@ function lanczos_full(
         throw(DimensionMismatch("out must have shape (m, length(v0))"))
 
     q = Vector{T}(v0)
-    q ./= norm(q)
+    q ./= initial_norm
     q_previous = zeros(T, n)
     beta_previous = zero(RT)
     alphas = RT[]
@@ -1146,7 +1225,13 @@ function lanczos_full(
     for index in 1:m
         Q_T[index, :] = q
         used = index
-        residual = Vector{T}(_lanczos_action(A, q))
+        residual = if index == 1
+            value = Vector{T}(first_action)
+            value ./= initial_norm
+            value
+        else
+            Vector{T}(_lanczos_action(A, q))
+        end
         index > 1 && (residual .-= beta_previous .* q_previous)
         alpha = real(dot(q, residual))
         residual .-= alpha .* q
@@ -1167,7 +1252,8 @@ function lanczos_full(
 
     tridiagonal = SymTridiagonal(alphas, betas)
     decomposition = eigen(tridiagonal)
-    return decomposition.values, decomposition.vectors, Q_T[1:used, :]
+    vectors = used == m ? Q_T : Q_T[1:used, :]
+    return decomposition.values, decomposition.vectors, vectors
 end
 
 """

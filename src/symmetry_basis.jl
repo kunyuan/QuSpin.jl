@@ -13,7 +13,13 @@ struct SymmetryData
     reduced::Bool
 end
 
-function _identity_symmetry_data(states::Vector{UInt64}, blocks)
+function _identity_symmetry_data(
+    states::Vector{UInt64},
+    blocks,
+    lookup::Dict{UInt64,Int}=Dict(
+        state => index for (index, state) in pairs(states)
+    ),
+)
     dimension = length(states)
     projector = sparse(
         collect(1:dimension),
@@ -23,8 +29,8 @@ function _identity_symmetry_data(states::Vector{UInt64}, blocks)
         dimension,
     )
     return SymmetryData(
-        copy(states),
-        Dict(state => index for (index, state) in pairs(states)),
+        states,
+        lookup,
         projector,
         Dict{Symbol,Any}(blocks),
         false,
@@ -109,7 +115,90 @@ function _intersect_eigenspace(
     eigenvalue::ComplexF64,
 )
     size(projector, 2) == 0 && return projector
-    represented = Matrix(projector' * symmetry * projector)
+    represented_sparse = sparse(projector' * symmetry * projector)
+    droptol!(represented_sparse, 5e-12)
+    reduced_dimension = size(represented_sparse, 2)
+    mapped_rows = zeros(Int, reduced_dimension)
+    mapped_phases = zeros(ComplexF64, reduced_dimension)
+    permutation_like = true
+    for column in 1:reduced_dimension
+        pointers = nzrange(represented_sparse, column)
+        if length(pointers) != 1
+            permutation_like = false
+            break
+        end
+        pointer = first(pointers)
+        mapped_rows[column] = rowvals(represented_sparse)[pointer]
+        mapped_phases[column] = nonzeros(represented_sparse)[pointer]
+        if !isapprox(abs(mapped_phases[column]), 1.0; atol=2e-10, rtol=2e-10)
+            permutation_like = false
+            break
+        end
+    end
+    permutation_like &=
+        length(unique(mapped_rows)) == reduced_dimension
+
+    if permutation_like
+        visited = falses(reduced_dimension)
+        rows = Int[]
+        columns = Int[]
+        values = ComplexF64[]
+        output_column = 0
+        for start in 1:reduced_dimension
+            visited[start] && continue
+            orbit = Int[]
+            phases = ComplexF64[]
+            current = start
+            while true
+                push!(orbit, current)
+                visited[current] = true
+                push!(phases, mapped_phases[current])
+                next_index = mapped_rows[current]
+                next_index == start && break
+                if visited[next_index]
+                    permutation_like = false
+                    break
+                end
+                current = next_index
+            end
+            permutation_like || break
+            coefficients = ones(ComplexF64, length(orbit))
+            for index in 1:(length(orbit) - 1)
+                coefficients[index + 1] =
+                    coefficients[index] * phases[index] / eigenvalue
+            end
+            closure = coefficients[end] * phases[end]
+            isapprox(
+                closure,
+                eigenvalue * coefficients[1];
+                atol=2e-10,
+                rtol=2e-10,
+            ) || continue
+            output_column += 1
+            normalization = norm(coefficients)
+            for (row, coefficient) in zip(orbit, coefficients)
+                push!(rows, row)
+                push!(columns, output_column)
+                push!(values, coefficient / normalization)
+            end
+        end
+        if permutation_like
+            output_column == 0 &&
+                return spzeros(ComplexF64, size(projector, 1), 0)
+            reduced_projector = sparse(
+                rows,
+                columns,
+                values,
+                reduced_dimension,
+                output_column,
+            )
+            result = sparse(projector * reduced_projector)
+            droptol!(result, 5e-14)
+            return result
+        end
+    end
+
+    represented = Matrix(represented_sparse)
     residual = represented - eigenvalue * I
     vectors = nullspace(residual; atol=2e-10, rtol=2e-10)
     isempty(vectors) && return spzeros(ComplexF64, size(projector, 1), 0)
@@ -126,7 +215,12 @@ function _representative_states(
     for column in axes(projector, 2)
         rows, values = findnz(@view projector[:, column])
         isempty(rows) && continue
-        index = rows[argmax(abs.(values))]
+        largest = firstindex(values)
+        for index in (firstindex(values) + 1):lastindex(values)
+            abs(values[index]) > abs(values[largest]) &&
+                (largest = index)
+        end
+        index = rows[largest]
         push!(representatives, parent_states[index])
     end
     return representatives
@@ -139,8 +233,9 @@ function _finalize_symmetry_data(
 )
     size(projector, 2) > 0 ||
         throw(ArgumentError("the requested symmetry sector is empty"))
-    gram = Matrix(projector' * projector)
-    isapprox(gram, Matrix{ComplexF64}(I, size(gram)); atol=2e-10, rtol=2e-10) ||
+    gram = sparse(projector' * projector)
+    residual = gram - spdiagm(0 => ones(ComplexF64, size(gram, 1)))
+    maximum(abs, nonzeros(residual); init=0.0) <= 4e-10 ||
         throw(ArgumentError("internal symmetry projector is not orthonormal"))
     return SymmetryData(
         copy(parent_states),
@@ -202,24 +297,31 @@ function _full_projection_matrix(
     symmetry::SymmetryData,
     full_dimension::Int,
     ::Type{T},
+    ;
+    sparse_output::Bool=false,
 ) where {T<:Number}
-    sector_rows = (Int(state) + 1 for state in symmetry.parent_states)
-    sector = sparse(
-        collect(sector_rows),
-        collect(1:length(symmetry.parent_states)),
-        ones(ComplexF64, length(symmetry.parent_states)),
-        full_dimension,
-        length(symmetry.parent_states),
-    )
-    projected = sector * symmetry.projector
-    if T <: Real
-        maximum(abs, imag.(nonzeros(projected)); init=0.0) <= 2e-12 ||
+    parent_projector = symmetry.projector
+    rows = Int[
+        Int(symmetry.parent_states[row]) + 1
+        for row in rowvals(parent_projector)
+    ]
+    values = if T <: Real
+        maximum(abs ∘ imag, nonzeros(parent_projector); init=0.0) <= 2e-12 ||
             throw(ArgumentError(
                 "this momentum sector requires a complex projection dtype",
             ))
-        return Matrix{T}(real.(projected))
+        T[real(value) for value in nonzeros(parent_projector)]
+    else
+        T[value for value in nonzeros(parent_projector)]
     end
-    return Matrix{T}(projected)
+    projected = SparseMatrixCSC(
+        full_dimension,
+        size(parent_projector, 2),
+        copy(parent_projector.colptr),
+        rows,
+        values,
+    )
+    return sparse_output ? projected : Matrix(projected)
 end
 
 _has_symmetry(data::SymmetryData) = data.reduced
@@ -228,9 +330,5 @@ function _basis_requires_complex(basis)
     hasfield(typeof(basis), :symmetry) || return false
     symmetry = getfield(basis, :symmetry)
     symmetry.reduced || return false
-    return maximum(
-        abs,
-        imag.(nonzeros(symmetry.projector));
-        init=0.0,
-    ) > 2e-12
+    return any(value -> abs(imag(value)) > 2e-12, nonzeros(symmetry.projector))
 end

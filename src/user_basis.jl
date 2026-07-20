@@ -35,40 +35,62 @@ function UserBasis(
     if explicit_states === nothing && pcon_dict isa AbstractDict
         explicit_states = get(pcon_dict, :states, get(pcon_dict, "states", nothing))
     end
-    state_set = explicit_states === nothing ?
-        nothing :
-        Set(UInt64.(collect(explicit_states)))
     predicate = if pre_check_state === nothing
         state -> true
+    elseif applicable(pre_check_state, zero(UInt64), N)
+        state -> Bool(pre_check_state(state, N))
+    elseif applicable(pre_check_state, zero(UInt64))
+        state -> Bool(pre_check_state(state))
     else
-        state -> try
-            Bool(pre_check_state(state, N))
-        catch error
-            error isa MethodError || rethrow()
-            Bool(pre_check_state(state))
-        end
-    end
-    keep = occupations -> begin
-        encoded = UInt64(sum(
-            occupations[site] * sps^(site - 1)
-            for site in 1:N
+        throw(ArgumentError(
+            "pre_check_state must accept (state) or (state, N)",
         ))
-        (state_set === nothing || encoded in state_set) && predicate(encoded)
     end
-    base = _make_discrete_basis(
-        Val(:user),
-        N,
-        sps,
-        pcon_dict,
-        keep,
-        "user-defined finite basis",
-        allowed_ops === nothing ? Tuple(keys(op_dict)) : Tuple(allowed_ops),
-    )
+    operators =
+        allowed_ops === nothing ?
+        Tuple(keys(op_dict)) :
+        Tuple(allowed_ops)
+    base = if explicit_states === nothing
+        keep = occupations -> begin
+            encoded = UInt64(sum(
+                occupations[site] * sps^(site - 1)
+                for site in 1:N
+            ))
+            predicate(encoded)
+        end
+        _make_discrete_basis(
+            Val(:user),
+            N,
+            sps,
+            pcon_dict,
+            keep,
+            "user-defined finite basis",
+            operators,
+        )
+    else
+        dimension = BigInt(sps)^N
+        dimension <= typemax(UInt64) ||
+            throw(ArgumentError("basis encoding exceeds UInt64"))
+        encoded = sort!(unique(UInt64.(collect(explicit_states))))
+        filter!(
+            state -> state < UInt64(dimension) && predicate(state),
+            encoded,
+        )
+        _discrete_basis_from_encoded(
+            Val(:user),
+            N,
+            sps,
+            pcon_dict,
+            encoded,
+            "user-defined finite basis",
+            operators,
+        )
+    end
     return UserBasis(
         base,
         basis_dtype,
         Dict{Any,Any}(op_dict),
-        allowed_ops === nothing ? Tuple(keys(op_dict)) : Tuple(allowed_ops),
+        operators,
         Dict{Symbol,Any}(Symbol(key) => value for (key, value) in blocks),
         noncommuting_bits,
     )
@@ -91,9 +113,14 @@ function Base.getproperty(basis::UserBasis, name::Symbol)
     return getfield(basis, name)
 end
 
-states(basis::UserBasis) = copy(basis.states)
-projection_matrix(basis::UserBasis, ::Type{T}=Float64) where {T<:Number} =
-    projection_matrix(basis.base, T)
+states(basis::UserBasis) =
+    basis.basis_dtype.(basis.base.encoded_states)
+projection_matrix(
+    basis::UserBasis,
+    ::Type{T}=Float64;
+    sparse::Bool=false,
+) where {T<:Number} =
+    projection_matrix(basis.base, T; sparse)
 project_from(basis::UserBasis, vector::AbstractVecOrMat; kwargs...) =
     project_from(basis.base, vector; kwargs...)
 get_vec(basis::UserBasis, vector::AbstractVecOrMat; kwargs...) =
@@ -122,8 +149,12 @@ function operator_matrix(
     basis::UserBasis,
     opstring::AbstractString,
     couplings,
+    ;
+    sparse::Bool=false,
 )
-    matrix = zeros(ComplexF64, length(basis), length(basis))
+    rows = Int[]
+    columns = Int[]
+    values = ComplexF64[]
     for coupling in couplings
         length(coupling) == length(opstring) + 1 ||
             throw(ArgumentError("operator arity and sites differ"))
@@ -164,17 +195,32 @@ function operator_matrix(
             end
             for (encoded, amplitude) in branches
                 row = get(basis.base.lookup, encoded, 0)
-                row == 0 || (matrix[row, column] += amplitude)
+                row == 0 && continue
+                push!(rows, row)
+                push!(columns, column)
+                push!(values, amplitude)
             end
         end
     end
-    return matrix
+    matrix = SparseArrays.sparse(
+        rows,
+        columns,
+        values,
+        length(basis),
+        length(basis),
+    )
+    return sparse ? matrix : Matrix(matrix)
 end
 
 function inplace_op!(out, basis::UserBasis, opstring, couplings)
     size(out) == (length(basis), length(basis)) ||
         throw(DimensionMismatch("out must have shape (Ns,Ns)"))
-    out .+= operator_matrix(basis, opstring, couplings)
+    out .+= operator_matrix(
+        basis,
+        opstring,
+        couplings;
+        sparse=true,
+    )
     return out
 end
 

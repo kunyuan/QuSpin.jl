@@ -110,6 +110,29 @@ end
 
 const SpinBasisGeneral = SpinBasis1D
 
+function _fixed_weight_states(L::Int, weight::Int)
+    count = binomial(L, weight)
+    result = Vector{UInt64}(undef, count)
+    if weight == 0
+        result[1] = 0
+        return result
+    elseif weight == L
+        result[1] = (UInt64(1) << L) - UInt64(1)
+        return result
+    end
+    state = (UInt64(1) << weight) - UInt64(1)
+    for index in eachindex(result)
+        result[index] = state
+        index == lastindex(result) && break
+        lowest = state & (~state + UInt64(1))
+        next_prefix = state + lowest
+        state =
+            next_prefix |
+            ((next_prefix ⊻ state) >> (trailing_zeros(lowest) + 2))
+    end
+    return result
+end
+
 function SpinBasis1D(
     L::Integer;
     nup::Union{Nothing,Integer}=nothing,
@@ -140,13 +163,9 @@ function SpinBasis1D(
         throw(ArgumentError("nup must lie between 0 and L"))
 
     wanted = selected_nup === nothing ? nothing : Int(selected_nup)
-    encoded = UInt64[]
-    sizehint!(encoded, wanted === nothing ? 1 << min(Int(L), 20) : 0)
-    last_state = (UInt64(1) << Int(L)) - UInt64(1)
-    for state in UInt64(0):last_state
-        wanted === nothing || count_ones(state) == wanted || continue
-        push!(encoded, state)
-    end
+    encoded = wanted === nothing ?
+        collect(UInt64(0):((UInt64(1) << Int(L)) - UInt64(1))) :
+        _fixed_weight_states(Int(L), wanted)
     lookup = Dict(state => i for (i, state) in pairs(encoded))
     blocks = Dict{Symbol,Any}(:nup => wanted, :pauli => pauli)
     requested = (
@@ -158,7 +177,7 @@ function SpinBasis1D(
         zBblock !== nothing
     )
     if !requested
-        symmetry = _identity_symmetry_data(encoded, blocks)
+        symmetry = _identity_symmetry_data(encoded, blocks, lookup)
         return SpinBasis1D(Int(L), wanted, pauli, encoded, lookup, symmetry)
     end
 
@@ -274,12 +293,15 @@ end
 function projection_matrix(
     basis::SpinBasis1D,
     ::Type{T}=Float64,
+    ;
+    sparse::Bool=false,
 ) where {T<:Number}
     return _full_projection_matrix(
         basis.encoded_states,
         basis.symmetry,
         1 << basis.L,
         T,
+        sparse_output=sparse,
     )
 end
 
@@ -291,7 +313,11 @@ function project_from(
 )
     size(vector, 1) == length(basis) ||
         throw(DimensionMismatch("the first vector dimension must equal Ns"))
-    return projection_matrix(basis, eltype(vector)) * vector
+    return projection_matrix(
+        basis,
+        eltype(vector);
+        sparse,
+    ) * vector
 end
 
 get_vec(basis::SpinBasis1D, vector::AbstractVecOrMat; kwargs...) =
@@ -367,6 +393,8 @@ function operator_matrix(
     basis::SpinBasis1D,
     opstring::AbstractString,
     couplings,
+    ;
+    sparse::Bool=false,
 )
     if _has_symmetry(basis.symmetry)
         parent_symmetry = _identity_symmetry_data(
@@ -381,37 +409,66 @@ function operator_matrix(
             copy(basis.symmetry.parent_lookup),
             parent_symmetry,
         )
-        parent_matrix = operator_matrix(parent, opstring, couplings)
-        return Matrix(basis.symmetry.projector' * parent_matrix *
-                      basis.symmetry.projector)
+        parent_matrix = operator_matrix(
+            parent,
+            opstring,
+            couplings;
+            sparse=true,
+        )
+        projected =
+            basis.symmetry.projector' *
+            parent_matrix *
+            basis.symmetry.projector
+        return sparse ? projected : Matrix(projected)
     end
-    matrix = zeros(ComplexF64, length(basis), length(basis))
+    rows = Int[]
+    columns = Int[]
+    values = ComplexF64[]
     for coupling in couplings
         length(coupling) == length(opstring) + 1 ||
             throw(ArgumentError("operator arity and sites differ"))
+        sites = Base.tail(coupling)
         for (column, initial) in pairs(basis.encoded_states)
             state = initial
             amplitude = complex(first(coupling))
             alive = true
-            for (op, site) in Iterators.reverse(
-                collect(zip(opstring, coupling[2:end])),
-            )
-                state, factor, alive = _apply_spin_local(basis, state, op, site)
+            for index in length(opstring):-1:1
+                state, factor, alive = _apply_spin_local(
+                    basis,
+                    state,
+                    opstring[index],
+                    sites[index],
+                )
                 alive || break
                 amplitude *= factor
             end
             alive || continue
             row = get(basis.lookup, state, 0)
-            row == 0 || (matrix[row, column] += amplitude)
+            row == 0 && continue
+            push!(rows, row)
+            push!(columns, column)
+            push!(values, amplitude)
         end
     end
-    return matrix
+    matrix = SparseArrays.sparse(
+        rows,
+        columns,
+        values,
+        length(basis),
+        length(basis),
+    )
+    return sparse ? matrix : Matrix(matrix)
 end
 
 function inplace_op!(out, basis::SpinBasis1D, opstring, couplings)
     size(out) == (length(basis), length(basis)) ||
         throw(DimensionMismatch("out must have shape (Ns,Ns)"))
-    out .+= operator_matrix(basis, opstring, couplings)
+    out .+= operator_matrix(
+        basis,
+        opstring,
+        couplings;
+        sparse=true,
+    )
     return out
 end
 
@@ -440,6 +497,7 @@ function _reduced_density_matrices(
     basis::SpinBasis1D,
     state::AbstractVector,
     sites_A,
+    return_rdm=:both,
 )
     length(state) == length(basis) ||
         throw(DimensionMismatch("state length must equal the basis dimension"))
@@ -454,31 +512,58 @@ function _reduced_density_matrices(
         column = _subsystem_index(encoded, sites_B)
         coefficients[row, column] = state[position]
     end
-    return coefficients * coefficients', coefficients' * coefficients
+    if return_rdm in (:A, "A")
+        return coefficients * coefficients'
+    elseif return_rdm in (:B, "B")
+        return coefficients' * coefficients
+    elseif return_rdm in (:both, "both")
+        return coefficients * coefficients', coefficients' * coefficients
+    end
+    throw(ArgumentError("return_rdm must be A, B, or both"))
 end
 
 function _reduced_density_matrices(
     basis::SpinBasis1D,
     state::AbstractMatrix,
     sites_A,
+    return_rdm=:both,
 )
     size(state) == (length(basis), length(basis)) ||
         throw(DimensionMismatch("density matrix must match the basis dimension"))
     sites_B = setdiff(collect(1:basis.L), sites_A)
-    rho_A = zeros(eltype(state), 1 << length(sites_A), 1 << length(sites_A))
-    rho_B = zeros(eltype(state), 1 << length(sites_B), 1 << length(sites_B))
-    for (row_position, row_state) in pairs(basis.encoded_states)
-        row_A = _subsystem_index(row_state, sites_A)
-        row_B = _subsystem_index(row_state, sites_B)
-        for (column_position, column_state) in pairs(basis.encoded_states)
-            column_A = _subsystem_index(column_state, sites_A)
-            column_B = _subsystem_index(column_state, sites_B)
+    need_A = return_rdm in (:A, "A", :both, "both")
+    need_B = return_rdm in (:B, "B", :both, "both")
+    need_A || need_B ||
+        throw(ArgumentError("return_rdm must be A, B, or both"))
+    rho_A = need_A ?
+        zeros(eltype(state), 1 << length(sites_A), 1 << length(sites_A)) :
+        nothing
+    rho_B = need_B ?
+        zeros(eltype(state), 1 << length(sites_B), 1 << length(sites_B)) :
+        nothing
+    indices_A = Int[
+        _subsystem_index(encoded, sites_A)
+        for encoded in basis.encoded_states
+    ]
+    indices_B = Int[
+        _subsystem_index(encoded, sites_B)
+        for encoded in basis.encoded_states
+    ]
+    for row_position in eachindex(basis.encoded_states)
+        row_A = indices_A[row_position]
+        row_B = indices_B[row_position]
+        for column_position in eachindex(basis.encoded_states)
+            column_A = indices_A[column_position]
+            column_B = indices_B[column_position]
             value = state[row_position, column_position]
-            row_B == column_B && (rho_A[row_A, column_A] += value)
-            row_A == column_A && (rho_B[row_B, column_B] += value)
+            need_A && row_B == column_B &&
+                (rho_A[row_A, column_A] += value)
+            need_B && row_A == column_A &&
+                (rho_B[row_B, column_B] += value)
         end
     end
-    return rho_A, rho_B
+    return need_A && need_B ? (rho_A, rho_B) :
+           need_A ? rho_A : rho_B
 end
 
 """
@@ -518,30 +603,46 @@ function partial_trace(
     if state isa AbstractMatrix && enforce_pure &&
        size(state, 1) == length(basis)
         reductions = [
-            _reduced_density_matrices(basis, @view(state[:, index]), sites_A)
+            _reduced_density_matrices(
+                basis,
+                @view(state[:, index]),
+                sites_A,
+                return_rdm,
+            )
             for index in axes(state, 2)
         ]
-        rho_A = cat((pair[1] for pair in reductions)...; dims=3)
-        rho_B = cat((pair[2] for pair in reductions)...; dims=3)
-    else
-        rho_A, rho_B = _reduced_density_matrices(basis, state, sites_A)
+        if return_rdm in (:both, "both")
+            rho_A = cat((pair[1] for pair in reductions)...; dims=3)
+            rho_B = cat((pair[2] for pair in reductions)...; dims=3)
+            return rho_A, rho_B
+        end
+        return cat(reductions...; dims=3)
     end
-    return return_rdm in (:A, "A") ? rho_A :
-           return_rdm in (:B, "B") ? rho_B :
-           return_rdm in (:both, "both") ? (rho_A, rho_B) :
-           throw(ArgumentError("return_rdm must be A, B, or both"))
+    return _reduced_density_matrices(
+        basis,
+        state,
+        sites_A,
+        return_rdm,
+    )
 end
 
-function _entropy_from_density(rho, alpha)
-    probabilities = real.(eigvals(Hermitian((rho + rho') / 2)))
+_density_eigenvalues(rho) =
+    real.(eigvals(Hermitian((rho + rho') / 2)))
+
+function _entropy_from_probabilities(probabilities, alpha)
     tolerance = 100 * eps(real(float(one(eltype(probabilities)))))
     probabilities = clamp.(probabilities, zero(eltype(probabilities)), Inf)
     probabilities = probabilities[probabilities .> tolerance]
     isempty(probabilities) && return zero(eltype(probabilities))
-    alpha == 1 && return -sum(p * log(p) for p in probabilities)
+    if abs(alpha - 1) <= sqrt(eps(float(alpha)))
+        return -sum(p * log(p) for p in probabilities)
+    end
     alpha > 0 || throw(ArgumentError("alpha must be positive"))
     return log(sum(p^alpha for p in probabilities)) / (1 - alpha)
 end
+
+_entropy_from_density(rho, alpha) =
+    _entropy_from_probabilities(_density_eigenvalues(rho), alpha)
 
 """
     ent_entropy(basis, state; ...)
@@ -572,17 +673,22 @@ function ent_entropy(
     normalization_A = density && !isempty(sites_A) ? length(sites_A) : 1
     sites_B = basis.L - length(sites_A)
     normalization_B = density && sites_B > 0 ? sites_B : 1
-    entropy_A = _entropy_from_density(rho_A, alpha) / normalization_A
+    probabilities_A = _density_eigenvalues(rho_A)
+    entropy_A =
+        _entropy_from_probabilities(probabilities_A, alpha) /
+        normalization_A
     result = Dict{String,Any}("Sent_A" => entropy_A)
     if return_rdm in (:A, "A", :both, "both")
         result["rdm_A"] = rho_A
     end
     if return_rdm in (:B, "B", :both, "both")
-        result["Sent_B"] = _entropy_from_density(rho_B, alpha) / normalization_B
+        result["Sent_B"] =
+            _entropy_from_density(rho_B, alpha) /
+            normalization_B
         result["rdm_B"] = rho_B
     end
     if return_rdm_EVs
-        result["p_A"] = real.(eigvals(Hermitian((rho_A + rho_A') / 2)))
+        result["p_A"] = probabilities_A
     end
     return result
 end
@@ -599,9 +705,21 @@ function coherent_state(a::Number, n::Integer; dtype::Union{Nothing,Type}=nothin
     T = dtype === nothing ? promote_type(Float64, typeof(a)) : dtype
     T <: Number || throw(ArgumentError("dtype must be a numeric type"))
     result = Vector{T}(undef, n)
-    result[1] = convert(T, exp(-abs2(a) / 2))
-    for level in 1:(n - 1)
-        result[level + 1] = result[level] * a / sqrt(level)
+    if iszero(a)
+        fill!(result, zero(T))
+        result[1] = one(T)
+        return result
+    end
+    magnitude = abs(a)
+    phase = a / magnitude
+    phase_power = one(phase)
+    log_amplitude = -abs2(a) / 2
+    log_magnitude = log(magnitude)
+    for level in 0:(n - 1)
+        result[level + 1] =
+            convert(T, exp(log_amplitude) * phase_power)
+        log_amplitude += log_magnitude - log(level + 1) / 2
+        phase_power *= phase
     end
     return result
 end
@@ -684,15 +802,24 @@ function basis_ones(shape, dtype::Type=UInt32)
 end
 
 function _bitwise_result(op, arguments...; out=nothing, where=nothing)
-    result = broadcast(op, arguments...)
     if where === nothing
-        out === nothing && return result
-        copyto!(out, result)
+        out === nothing && return broadcast(op, arguments...)
+        broadcast!(op, out, arguments...)
         return out
     end
+    result = broadcast(op, arguments...)
     result isa AbstractArray ||
         return Bool(where) ? result : (out === nothing ? zero(result) : out)
-    destination = out === nothing ? fill!(similar(result), zero(eltype(result))) : out
+    if out === nothing
+        broadcast!(
+            (new, keep) -> keep ? new : zero(new),
+            result,
+            result,
+            where,
+        )
+        return result
+    end
+    destination = out
     axes(destination) == axes(result) ||
         throw(DimensionMismatch("out and broadcast result must have the same axes"))
     broadcast!((new, keep, old) -> keep ? new : old, destination, result, where, destination)

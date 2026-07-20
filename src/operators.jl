@@ -185,6 +185,43 @@ function _apply_local(
     end
 end
 
+function _assemble_spin_term!(
+    rows::Vector{Int},
+    columns::Vector{Int},
+    values::Vector{T},
+    basis::SpinBasis1D,
+    term::OperatorTerm{C},
+) where {T,C}
+    operator_length = length(term.op)
+    for coupling in term.couplings
+        coefficient = convert(T, first(coupling))
+        sites = Base.tail(coupling)
+        for (column, initial_state) in pairs(basis.encoded_states)
+            amplitude = coefficient
+            state = initial_state
+            alive = true
+            for operator_index in operator_length:-1:1
+                op = term.op[operator_index]
+                state, factor, alive = _apply_local(
+                    basis,
+                    state,
+                    op,
+                    sites[operator_index],
+                )
+                alive || break
+                amplitude *= convert(T, factor)
+            end
+            alive || continue
+            row = get(basis.lookup, state, 0)
+            iszero(row) && continue
+            push!(rows, row)
+            push!(columns, column)
+            push!(values, amplitude)
+        end
+    end
+    return nothing
+end
+
 function _assemble(
     basis::AbstractBasis,
     terms::AbstractVector{<:OperatorTerm},
@@ -201,25 +238,8 @@ function _assemble(
     rows = Int[]
     columns = Int[]
     values = T[]
-    for (column, initial_state) in pairs(basis.encoded_states)
-        for term in terms, coupling in term.couplings
-            amplitude = convert(T, first(coupling))
-            state = initial_state
-            alive = true
-            for operator_index in length(term.op):-1:1
-                op = term.op[operator_index]
-                site = coupling[operator_index + 1]
-                state, factor, alive = _apply_local(basis, state, op, site)
-                alive || break
-                amplitude *= factor
-            end
-            alive || continue
-            row = get(basis.lookup, state, 0)
-            iszero(row) && continue
-            push!(rows, row)
-            push!(columns, column)
-            push!(values, amplitude)
-        end
+    for term in terms
+        _assemble_spin_term!(rows, columns, values, basis, term)
     end
     normalized = _normalize_matrix_format(format)
     matrix = sparse(rows, columns, values, length(basis), length(basis))
@@ -389,6 +409,18 @@ Base.eltype(H::Hamiltonian) = eltype(H.data)
 Base.getindex(H::Hamiltonian, indices...) = getindex(H.data, indices...)
 Base.Matrix(H::Hamiltonian) = Matrix(H.data)
 Base.:*(H::Hamiltonian, vector::AbstractVecOrMat) = H.data * vector
+LinearAlgebra.mul!(
+    output::AbstractVecOrMat,
+    H::Hamiltonian,
+    value::AbstractVecOrMat,
+) = mul!(output, H.data, value)
+LinearAlgebra.mul!(
+    output::AbstractVecOrMat,
+    H::Hamiltonian,
+    value::AbstractVecOrMat,
+    alpha::Number,
+    beta::Number,
+) = mul!(output, H.data, value, alpha, beta)
 LinearAlgebra.ishermitian(H::Hamiltonian) = ishermitian(H.data)
 
 function Base.getproperty(H::Hamiltonian, name::Symbol)
@@ -553,21 +585,68 @@ function _copy_or_write(value, out)
     return out
 end
 
+_action_output(::Type{T}, rows::Integer, value::AbstractVector) where {T} =
+    zeros(T, rows)
+_action_output(::Type{T}, rows::Integer, value::AbstractMatrix) where {T} =
+    zeros(T, rows, size(value, 2))
+
+function _matrix_mul_add!(
+    output::AbstractVecOrMat,
+    matrix,
+    value::AbstractVecOrMat,
+    alpha::Number,
+    beta::Number,
+)
+    if applicable(mul!, output, matrix, value, alpha, beta)
+        mul!(output, matrix, value, alpha, beta)
+        return output
+    end
+    product = matrix * value
+    if iszero(beta)
+        @. output = alpha * product
+    else
+        @. output = beta * output + alpha * product
+    end
+    return output
+end
+
 function apply(
     H::Hamiltonian,
-    value;
+    value::AbstractVecOrMat;
     time=0,
     check::Bool=true,
     out=nothing,
     overwrite_out::Bool=true,
     a::Number=1,
 )
-    result = a * (_matrix_at(H, time) * value)
-    out === nothing && return result
-    axes(out) == axes(result) ||
+    size(value, 1) == size(H, 2) ||
+        throw(DimensionMismatch("Hamiltonian and value dimensions do not match"))
+    coefficients = [
+        function_value(time, arguments...)
+        for (_, function_value, arguments) in H.dynamic_terms
+    ]
+    T = promote_type(
+        eltype(H),
+        eltype(value),
+        typeof(a),
+        (typeof(coefficient) for coefficient in coefficients)...,
+    )
+    result = out === nothing ?
+        _action_output(T, size(H, 1), value) :
+        out
+    expected_axes = value isa AbstractVector ?
+        (axes(H.data, 1),) :
+        (axes(H.data, 1), axes(value, 2))
+    axes(result) == expected_axes ||
         throw(DimensionMismatch("out must have the same axes as the result"))
-    overwrite_out ? copyto!(out, result) : (out .+= result)
-    return out
+    input = Base.mightalias(result, value) ? copy(value) : value
+    beta = out === nothing || overwrite_out ? zero(a) : one(a)
+    _matrix_mul_add!(result, H.data, input, a, beta)
+    for ((matrix, _, _), coefficient) in zip(H.dynamic_terms, coefficients)
+        iszero(coefficient) && continue
+        _matrix_mul_add!(result, matrix, input, a * coefficient, true)
+    end
+    return result
 end
 
 function right_apply(
@@ -653,6 +732,97 @@ function eigsh(
         ordered_values
 end
 
+function _operator_mul!(
+    output::AbstractVector,
+    operator,
+    input::AbstractVector,
+)
+    if applicable(mul!, output, operator, input)
+        mul!(output, operator, input)
+    else
+        copyto!(output, operator * input)
+    end
+    return output
+end
+
+function _krylov_factorization(
+    operator,
+    vector::AbstractVector,
+    ::Type{T};
+    krylov_dim::Integer=30,
+) where {T}
+    size(operator, 1) == size(operator, 2) == length(vector) ||
+        throw(DimensionMismatch("operator and vector dimensions do not match"))
+    krylov_dim > 0 || throw(ArgumentError("krylov_dim must be positive"))
+    initial = Vector{T}(vector)
+    beta = norm(initial)
+
+    dimension = length(initial)
+    steps = min(Int(krylov_dim), dimension)
+    basis = zeros(T, dimension, steps + 1)
+    hessenberg = zeros(T, steps + 1, steps)
+    @views @. basis[:, 1] = initial / beta
+    residual = similar(initial)
+    completed = steps
+    terminal_norm = 0.0
+    for column in 1:steps
+        _operator_mul!(residual, operator, @view(basis[:, column]))
+        for row in 1:column
+            coefficient = dot(@view(basis[:, row]), residual)
+            hessenberg[row, column] = coefficient
+            axpy!(-coefficient, @view(basis[:, row]), residual)
+        end
+        for row in 1:column
+            correction = dot(@view(basis[:, row]), residual)
+            hessenberg[row, column] += correction
+            axpy!(-correction, @view(basis[:, row]), residual)
+        end
+        terminal_norm = norm(residual)
+        hessenberg[column + 1, column] = terminal_norm
+        if terminal_norm <= 100eps(Float64) * max(1.0, norm(hessenberg))
+            completed = column
+            break
+        elseif column < steps
+            @views @. basis[:, column + 1] = residual / terminal_norm
+        end
+    end
+    return (
+        initial=initial,
+        beta=beta,
+        basis=basis,
+        hessenberg=hessenberg,
+        completed=completed,
+        terminal_norm=terminal_norm,
+        dimension=dimension,
+        steps=steps,
+    )
+end
+
+function _krylov_project(factorization, scale::Number)
+    completed = factorization.completed
+    reduced = Matrix(@view factorization.hessenberg[1:completed, 1:completed])
+    exponential = exp(scale .* reduced)
+    result = similar(
+        factorization.initial,
+        promote_type(eltype(factorization.initial), eltype(exponential)),
+    )
+    mul!(
+        result,
+        @view(factorization.basis[:, 1:completed]),
+        @view(exponential[:, 1]),
+    )
+    lmul!(factorization.beta, result)
+    estimate =
+        completed == factorization.steps &&
+        completed < factorization.dimension ?
+        abs(scale) *
+        factorization.terminal_norm *
+        factorization.beta *
+        abs(exponential[end, 1]) :
+        0.0
+    return result, estimate
+end
+
 function _krylov_expmv_vector(
     operator,
     vector::AbstractVector,
@@ -668,44 +838,14 @@ function _krylov_expmv_vector(
     T = promote_type(eltype(operator), eltype(vector), typeof(scale))
     initial = Vector{T}(vector)
     iszero(scale) && return initial
-    beta = norm(initial)
-    iszero(beta) && return initial
-
-    dimension = length(initial)
-    steps = min(Int(krylov_dim), dimension)
-    basis = zeros(T, dimension, steps + 1)
-    hessenberg = zeros(T, steps + 1, steps)
-    basis[:, 1] .= initial ./ beta
-    completed = steps
-    terminal_norm = 0.0
-    for column in 1:steps
-        residual = operator * @view(basis[:, column])
-        for row in 1:column
-            coefficient = dot(@view(basis[:, row]), residual)
-            hessenberg[row, column] = coefficient
-            residual = residual - coefficient .* @view(basis[:, row])
-        end
-        for row in 1:column
-            correction = dot(@view(basis[:, row]), residual)
-            hessenberg[row, column] += correction
-            residual = residual - correction .* @view(basis[:, row])
-        end
-        terminal_norm = norm(residual)
-        hessenberg[column + 1, column] = terminal_norm
-        if terminal_norm <= 100eps(Float64) * max(1.0, norm(hessenberg))
-            completed = column
-            break
-        elseif column < steps
-            basis[:, column + 1] .= residual ./ terminal_norm
-        end
-    end
-
-    reduced = Matrix(@view hessenberg[1:completed, 1:completed])
-    exponential = exp(scale .* reduced)
-    result = beta .* (@view(basis[:, 1:completed]) * @view(exponential[:, 1]))
-    estimate = completed == steps && completed < dimension ?
-        abs(scale) * terminal_norm * beta * abs(exponential[end, 1]) :
-        0.0
+    iszero(norm(initial)) && return initial
+    factorization = _krylov_factorization(
+        operator,
+        initial,
+        T;
+        krylov_dim,
+    )
+    result, estimate = _krylov_project(factorization, scale)
     if estimate > tol * max(1.0, norm(result))
         depth < 14 || throw(ErrorException(
             "Krylov exponential action did not converge; increase krylov_dim",
@@ -728,6 +868,53 @@ function _krylov_expmv_vector(
         )
     end
     return result
+end
+
+function _krylov_expmv_times(
+    operator,
+    vector::AbstractVector,
+    scales::AbstractVector;
+    tol::Real=1e-12,
+    krylov_dim::Integer=30,
+)
+    size(operator, 1) == size(operator, 2) == length(vector) ||
+        throw(DimensionMismatch("operator and vector dimensions do not match"))
+    tol > 0 || throw(ArgumentError("tol must be positive"))
+    krylov_dim > 0 || throw(ArgumentError("krylov_dim must be positive"))
+    T = promote_type(eltype(operator), eltype(vector), eltype(scales))
+    initial = Vector{T}(vector)
+    results = Matrix{T}(undef, length(initial), length(scales))
+    isempty(scales) && return results
+    if iszero(norm(initial)) || all(iszero, scales)
+        for column in axes(results, 2)
+            copyto!(@view(results[:, column]), initial)
+        end
+        return results
+    end
+    factorization = _krylov_factorization(
+        operator,
+        initial,
+        T;
+        krylov_dim,
+    )
+    for (column, scale) in pairs(scales)
+        if iszero(scale)
+            copyto!(@view(results[:, column]), initial)
+            continue
+        end
+        state, estimate = _krylov_project(factorization, scale)
+        if estimate > tol * max(1.0, norm(state))
+            state = _krylov_expmv_vector(
+                operator,
+                initial,
+                scale;
+                tol,
+                krylov_dim,
+            )
+        end
+        copyto!(@view(results[:, column]), state)
+    end
+    return results
 end
 
 _krylov_expmv(operator, value::AbstractVector, scale::Number; kwargs...) =
@@ -772,10 +959,12 @@ function evolve(
             steps = max(1, ceil(Int, (target - current) / max_step))
             step = (target - current) / steps
             derivative = if state isa AbstractVector
-                (time, value) -> begin
-                    matrix = _matrix_at(H, time)
-                    imag_time ? -(matrix * value) : -im .* (matrix * value)
-                end
+                (time, value) -> apply(
+                    H,
+                    value;
+                    time,
+                    a=imag_time ? -1 : -im,
+                )
             else
                 (time, value) -> begin
                     matrix = _matrix_at(H, time)
@@ -807,22 +996,21 @@ function evolve(
 
     offsets = collect(times) .- t0
     if v0 isa AbstractVector
-        states = [
-            begin
-                scale = imag_time ? -time : -im * time
-                state = _krylov_expmv(
-                    H.data,
-                    v0,
-                    scale;
-                    tol=get(kwargs, :tol, 1e-12),
-                    krylov_dim=get(kwargs, :krylov_dim, 30),
-                )
-                imag_time ? state / norm(state) : state
+        scales = imag_time ? -offsets : -im .* offsets
+        states = _krylov_expmv_times(
+            H.data,
+            v0,
+            scales;
+            tol=get(kwargs, :tol, 1e-12),
+            krylov_dim=get(kwargs, :krylov_dim, 30),
+        )
+        if imag_time
+            for state in eachcol(states)
+                rmul!(state, inv(norm(state)))
             end
-            for time in offsets
-        ]
-        iterate && return (state for state in states)
-        return reduce(hcat, states)
+        end
+        iterate && return (copy(state) for state in eachcol(states))
+        return states
     end
     size(v0, 1) == size(v0, 2) == size(H, 1) ||
         throw(DimensionMismatch("density matrix must match Hamiltonian"))
@@ -849,16 +1037,35 @@ function evolve(
     return cat(states...; dims=3)
 end
 
-function expt_value(H::Hamiltonian, state; time=0, enforce_pure::Bool=false, kwargs...)
-    matrix = _matrix_at(H, time)
-    if state isa AbstractVector
-        return dot(state, matrix * state)
-    elseif ndims(state) == 3
-        return [tr(@view(state[:, :, index]) * matrix) for index in axes(state, 3)]
-    elseif enforce_pure || size(state, 2) != size(H, 1)
-        return [dot(column, matrix * column) for column in eachcol(state)]
+function _trace_product(left::AbstractMatrix, right::AbstractMatrix)
+    size(left, 2) == size(right, 1) &&
+        size(left, 1) == size(right, 2) ||
+        throw(DimensionMismatch("trace product requires transposed dimensions"))
+    T = promote_type(eltype(left), eltype(right))
+    result = zero(T)
+    @inbounds for column in axes(left, 2), row in axes(left, 1)
+        result += left[row, column] * right[column, row]
     end
-    return tr(state * matrix)
+    return result
+end
+
+function expt_value(H::Hamiltonian, state; time=0, enforce_pure::Bool=false, kwargs...)
+    if state isa AbstractVector
+        return dot(state, apply(H, state; time))
+    elseif ndims(state) == 3
+        matrix = _matrix_at(H, time)
+        return [
+            _trace_product(@view(state[:, :, index]), matrix)
+            for index in axes(state, 3)
+        ]
+    elseif enforce_pure || size(state, 2) != size(H, 1)
+        acted = apply(H, state; time)
+        return [
+            dot(@view(state[:, column]), @view(acted[:, column]))
+            for column in axes(state, 2)
+        ]
+    end
+    return _trace_product(state, _matrix_at(H, time))
 end
 
 function matrix_ele(
@@ -888,8 +1095,21 @@ function project_to(H::Hamiltonian, projector)
 end
 
 function quant_fluct(H::Hamiltonian, state; time=0, enforce_pure::Bool=false, kwargs...)
-    matrix = _matrix_at(H, time)
     mean = expt_value(H, state; time, enforce_pure)
+    if state isa AbstractVector
+        first_action = apply(H, state; time)
+        second = dot(state, apply(H, first_action; time))
+        return second - mean^2
+    elseif enforce_pure || (ndims(state) == 2 && size(state, 2) != size(H, 1))
+        first_action = apply(H, state; time)
+        second_action = apply(H, first_action; time)
+        second = [
+            dot(@view(state[:, column]), @view(second_action[:, column]))
+            for column in axes(state, 2)
+        ]
+        return second .- mean .^ 2
+    end
+    matrix = _matrix_at(H, time)
     H2 = _hamiltonian_from_data(H.basis, matrix * matrix)
     second = expt_value(H2, state; time, enforce_pure)
     return second .- mean .^ 2
@@ -976,9 +1196,11 @@ function _apply_spin_term!(
     basis::SpinBasis1D,
     term::OperatorTerm,
     vector::AbstractVector,
+    alpha::Number=1,
 )
     for coupling in term.couplings
-        coefficient = first(coupling)
+        coefficient = alpha * first(coupling)
+        sites = Base.tail(coupling)
         operator_length = length(term.op)
         for (column, initial_state) in pairs(basis.encoded_states)
             input = vector[column]
@@ -988,7 +1210,7 @@ function _apply_spin_term!(
             alive = true
             for operator_index in operator_length:-1:1
                 op = term.op[operator_index]
-                site = coupling[operator_index + 1]
+                site = sites[operator_index]
                 state, factor, alive = _apply_local(basis, state, op, site)
                 alive || break
                 amplitude *= factor
@@ -1001,23 +1223,34 @@ function _apply_spin_term!(
     return result
 end
 
-function _apply_spin_terms(
+function _apply_spin_terms!(
+    result::AbstractVector,
     basis::SpinBasis1D,
     terms::Vector{OperatorTerm},
     vector::AbstractVector,
+    alpha::Number=1,
 )
     if Basis._has_symmetry(basis.symmetry)
         parent = Basis._parent_basis_for_checks(basis)
         lifted = basis.symmetry.projector * vector
         acted = _apply_spin_terms(parent, terms, lifted)
-        return basis.symmetry.projector' * acted
+        mul!(result, basis.symmetry.projector', acted, alpha, true)
+        return result
     end
-    T = promote_type(eltype(vector), _coefficient_type(terms))
-    result = zeros(T, length(basis))
     for term in terms
-        _apply_spin_term!(result, basis, term, vector)
+        _apply_spin_term!(result, basis, term, vector, alpha)
     end
     return result
+end
+
+function _apply_spin_terms(
+    basis::SpinBasis1D,
+    terms::Vector{OperatorTerm},
+    vector::AbstractVector,
+)
+    T = promote_type(eltype(vector), _coefficient_type(terms))
+    result = zeros(T, length(basis))
+    return _apply_spin_terms!(result, basis, terms, vector)
 end
 
 function _apply_discrete_term!(
@@ -1025,6 +1258,7 @@ function _apply_discrete_term!(
     basis::Basis.DiscreteBasis,
     term::OperatorTerm,
     vector::AbstractVector,
+    alpha::Number=1,
 )
     for coupling in term.couplings
         actions = Basis._operator_actions(
@@ -1032,7 +1266,7 @@ function _apply_discrete_term!(
             term.op,
             coupling[2:end],
         )
-        coefficient = first(coupling)
+        coefficient = alpha * first(coupling)
         for (column, initial_occupations) in enumerate(eachrow(basis.occupations))
             input = vector[column]
             iszero(input) && continue
@@ -1062,23 +1296,34 @@ function _apply_discrete_term!(
     return result
 end
 
-function _apply_discrete_terms(
+function _apply_discrete_terms!(
+    result::AbstractVector,
     basis::Basis.DiscreteBasis,
     terms::Vector{OperatorTerm},
     vector::AbstractVector,
+    alpha::Number=1,
 )
     if Basis._has_symmetry(basis.symmetry)
         parent = Basis._parent_basis_for_checks(basis)
         lifted = basis.symmetry.projector * vector
         acted = _apply_discrete_terms(parent, terms, lifted)
-        return basis.symmetry.projector' * acted
+        mul!(result, basis.symmetry.projector', acted, alpha, true)
+        return result
     end
-    T = promote_type(eltype(vector), _coefficient_type(terms))
-    result = zeros(T, length(basis))
     for term in terms
-        _apply_discrete_term!(result, basis, term, vector)
+        _apply_discrete_term!(result, basis, term, vector, alpha)
     end
     return result
+end
+
+function _apply_discrete_terms(
+    basis::Basis.DiscreteBasis,
+    terms::Vector{OperatorTerm},
+    vector::AbstractVector,
+)
+    T = promote_type(eltype(vector), _coefficient_type(terms))
+    result = zeros(T, length(basis))
+    return _apply_discrete_terms!(result, basis, terms, vector)
 end
 
 function _apply_user_term!(
@@ -1086,10 +1331,11 @@ function _apply_user_term!(
     basis::Basis.UserBasis,
     term::OperatorTerm,
     vector::AbstractVector,
+    alpha::Number=1,
 )
     for coupling in term.couplings
         actions = collect(zip(term.op, coupling[2:end]))
-        coefficient = first(coupling)
+        coefficient = alpha * first(coupling)
         for (column, initial) in pairs(basis.base.encoded_states)
             input = vector[column]
             iszero(input) && continue
@@ -1128,6 +1374,19 @@ function _apply_user_term!(
     return result
 end
 
+function _apply_user_terms!(
+    result::AbstractVector,
+    basis::Basis.UserBasis,
+    terms::Vector{OperatorTerm},
+    vector::AbstractVector,
+    alpha::Number=1,
+)
+    for term in terms
+        _apply_user_term!(result, basis, term, vector, alpha)
+    end
+    return result
+end
+
 function _apply_user_terms(
     basis::Basis.UserBasis,
     terms::Vector{OperatorTerm},
@@ -1135,8 +1394,25 @@ function _apply_user_terms(
 )
     T = promote_type(eltype(vector), _coefficient_type(terms))
     result = zeros(T, length(basis))
+    return _apply_user_terms!(result, basis, terms, vector)
+end
+
+_apply_terms!(result, basis::SpinBasis1D, terms, vector, alpha=1) =
+    _apply_spin_terms!(result, basis, terms, vector, alpha)
+_apply_terms!(result, basis::Basis.DiscreteBasis, terms, vector, alpha=1) =
+    _apply_discrete_terms!(result, basis, terms, vector, alpha)
+_apply_terms!(result, basis::Basis.UserBasis, terms, vector, alpha=1) =
+    _apply_user_terms!(result, basis, terms, vector, alpha)
+function _apply_terms!(
+    result,
+    basis::AbstractBasis,
+    terms,
+    vector,
+    alpha=1,
+)
     for term in terms
-        _apply_user_term!(result, basis, term, vector)
+        matrix = Basis.operator_matrix(basis, term.op, term.couplings)
+        mul!(result, matrix, vector, alpha, true)
     end
     return result
 end
@@ -1181,26 +1457,50 @@ function _apply_linear_base(
     operator::QuantumLinearOperator,
     value::AbstractVector,
 )
-    operator.explicit_data === nothing ?
-        _apply_terms(operator.basis, operator.static_list, value) :
-        operator.explicit_data * value
+    T = promote_type(eltype(operator), eltype(value))
+    result = zeros(T, size(operator, 1))
+    if operator.explicit_data === nothing
+        _apply_terms!(
+            result,
+            operator.basis,
+            operator.static_list,
+            value,
+        )
+    else
+        mul!(result, operator.explicit_data, value)
+    end
+    return result
 end
 
 function _apply_linear_base(
     operator::QuantumLinearOperator,
     value::AbstractMatrix,
 )
-    return reduce(
-        hcat,
-        (_apply_linear_base(operator, column) for column in eachcol(value)),
-    )
+    T = promote_type(eltype(operator), eltype(value))
+    result = zeros(T, size(operator, 1), size(value, 2))
+    for column in axes(value, 2)
+        output = @view result[:, column]
+        input = @view value[:, column]
+        if operator.explicit_data === nothing
+            _apply_terms!(
+                output,
+                operator.basis,
+                operator.static_list,
+                input,
+            )
+        else
+            mul!(output, operator.explicit_data, input)
+        end
+    end
+    return result
 end
 
 function _apply_linear(operator::QuantumLinearOperator, value::AbstractVecOrMat)
     size(value, 1) == length(operator.diagonal) ||
         throw(DimensionMismatch("operator and value dimensions do not match"))
-    return _apply_linear_base(operator, value) .+
-        operator.diagonal .* value
+    result = _apply_linear_base(operator, value)
+    result .+= operator.diagonal .* value
+    return result
 end
 
 function _linear_data(operator::QuantumLinearOperator)
@@ -1230,7 +1530,34 @@ LinearAlgebra.mul!(
     output::AbstractVector,
     operator::QuantumLinearOperator,
     value::AbstractVector,
-) = copyto!(output, operator * value)
+) = mul!(output, operator, value, true, false)
+function LinearAlgebra.mul!(
+    output::AbstractVector,
+    operator::QuantumLinearOperator,
+    value::AbstractVector,
+    alpha::Number,
+    beta::Number,
+)
+    length(output) == size(operator, 1) ||
+        throw(DimensionMismatch("output and operator dimensions do not match"))
+    length(value) == size(operator, 2) ||
+        throw(DimensionMismatch("operator and value dimensions do not match"))
+    input = Base.mightalias(output, value) ? copy(value) : value
+    iszero(beta) ? fill!(output, zero(eltype(output))) : lmul!(beta, output)
+    if operator.explicit_data === nothing
+        _apply_terms!(
+            output,
+            operator.basis,
+            operator.static_list,
+            input,
+            alpha,
+        )
+    else
+        mul!(output, operator.explicit_data, input, alpha, true)
+    end
+    @. output += alpha * operator.diagonal * input
+    return output
+end
 LinearAlgebra.ishermitian(operator::QuantumLinearOperator) = operator.hermitian
 
 function Base.getproperty(operator::QuantumLinearOperator, name::Symbol)
@@ -1353,7 +1680,7 @@ function expt_value(
     elseif enforce_pure || size(state, 2) != size(operator, 1)
         return [dot(column, operator * column) for column in eachcol(state)]
     end
-    return tr(state * _linear_data(operator))
+    return _trace_product(state, _linear_data(operator))
 end
 
 function matrix_ele(
@@ -1577,17 +1904,46 @@ LinearAlgebra.tr(operator::QuantumOperator; pars::AbstractDict=Dict()) =
 
 function apply(
     operator::QuantumOperator,
-    value;
+    value::AbstractVecOrMat;
     pars::AbstractDict=Dict(),
     out=nothing,
     overwrite_out::Bool=true,
     a::Number=1,
     kwargs...,
 )
-    result = a * (_parameter_matrix(operator, pars) * value)
-    out === nothing && return result
-    overwrite_out ? copyto!(out, result) : (out .+= result)
-    return out
+    size(value, 1) == size(operator, 2) ||
+        throw(DimensionMismatch("operator and value dimensions do not match"))
+    component_pairs = collect(operator.components)
+    coefficients = [
+        get(pars, key, zero(eltype(operator)))
+        for (key, _) in component_pairs
+    ]
+    T = promote_type(
+        eltype(operator),
+        eltype(value),
+        typeof(a),
+        (typeof(coefficient) for coefficient in coefficients)...,
+    )
+    result = out === nothing ?
+        _action_output(T, size(operator, 1), value) :
+        out
+    expected_axes = value isa AbstractVector ?
+        (axes(first(values(operator.components)), 1),) :
+        (
+            axes(first(values(operator.components)), 1),
+            axes(value, 2),
+        )
+    axes(result) == expected_axes ||
+        throw(DimensionMismatch("out must have the same axes as the result"))
+    input = Base.mightalias(result, value) ? copy(value) : value
+    if out === nothing || overwrite_out
+        fill!(result, zero(eltype(result)))
+    end
+    for ((_, matrix), coefficient) in zip(component_pairs, coefficients)
+        iszero(coefficient) && continue
+        _matrix_mul_add!(result, matrix, input, a * coefficient, true)
+    end
+    return result
 end
 
 function right_apply(
@@ -1671,12 +2027,23 @@ function expt_value(
     enforce_pure::Bool=false,
     kwargs...,
 )
-    return expt_value(
-        tohamiltonian(operator; pars),
-        state;
-        enforce_pure,
-        kwargs...,
-    )
+    if state isa AbstractVector
+        return dot(state, apply(operator, state; pars))
+    elseif enforce_pure || (ndims(state) == 2 && size(state, 2) != size(operator, 1))
+        acted = apply(operator, state; pars)
+        return [
+            dot(@view(state[:, column]), @view(acted[:, column]))
+            for column in axes(state, 2)
+        ]
+    end
+    matrix = _parameter_matrix(operator, pars)
+    if ndims(state) == 3
+        return [
+            _trace_product(@view(state[:, :, index]), matrix)
+            for index in axes(state, 3)
+        ]
+    end
+    return _trace_product(state, matrix)
 end
 
 function matrix_ele(
@@ -1698,6 +2065,21 @@ function quant_fluct(
     enforce_pure::Bool=false,
     kwargs...,
 )
+    if state isa AbstractVector
+        mean = expt_value(operator, state; pars)
+        first_action = apply(operator, state; pars)
+        second = dot(state, apply(operator, first_action; pars))
+        return second - mean^2
+    elseif enforce_pure || (ndims(state) == 2 && size(state, 2) != size(operator, 1))
+        mean = expt_value(operator, state; pars, enforce_pure=true)
+        first_action = apply(operator, state; pars)
+        second_action = apply(operator, first_action; pars)
+        second = [
+            dot(@view(state[:, column]), @view(second_action[:, column]))
+            for column in axes(state, 2)
+        ]
+        return second .- mean .^ 2
+    end
     return quant_fluct(
         tohamiltonian(operator; pars),
         state;

@@ -89,6 +89,9 @@ end
     @test ints_to_array(encoded, 4) == binary
     @test array_to_ints(binary) == encoded
     @test array_to_ints(binary, UInt256) == UInt256.(encoded)
+    wide_encoded = UInt256[(UInt256(1) << 200) | UInt256(3)]
+    @test array_to_ints(ints_to_array(wide_encoded, 201), UInt256) ==
+        wide_encoded
 
     @test kl_div([0.25, 0.75], [0.5, 0.5]) ≈ 0.13081203594113697
     @test_throws DimensionMismatch kl_div([0.5, 0.5], [1.0])
@@ -711,6 +714,15 @@ end
     @test H.data isa Matrix
     @test update_matrix_formats!(H, :csr) === H
     @test H.data isa SparseMatrixCSR
+    for storage in (H.data, DIAMatrix(sparse(H.data)))
+        destination = ComplexF64[0.5, -0.25, 0.75, -1.0]
+        original_destination = copy(destination)
+        @test mul!(destination, storage, vector, 1.25, -0.5) ===
+            destination
+        @test destination ≈
+            1.25 .* (storage * vector) .-
+            0.5 .* original_destination atol=3e-16
+    end
 end
 
 @testset "QuantumOperator native archive" begin
@@ -764,6 +776,11 @@ end
 
     vector = normalize(ComplexF64[1, 2im, -0.5])
     @test operator * vector ≈ matrix * vector atol=3e-16
+    destination = ComplexF64[0.25, -0.5im, 0.75]
+    original_destination = copy(destination)
+    @test mul!(destination, operator, vector, 1.25, -0.5) === destination
+    @test destination ≈
+        1.25 .* (matrix * vector) .- 0.5 .* original_destination atol=3e-16
     @test apply(operator, vector) ≈ matrix * vector atol=3e-16
     @test right_apply(operator, vector) == vec(transpose(vector) * matrix)
     @test Matrix(conj(operator)) == conj(matrix)

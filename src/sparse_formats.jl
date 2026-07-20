@@ -85,27 +85,66 @@ end
 SparseArrays.nnz(matrix::SparseMatrixCSR) = length(matrix.nzval)
 SparseArrays.SparseMatrixCSC(matrix::SparseMatrixCSR) = sparse(matrix)
 
-function _csr_mul(matrix::SparseMatrixCSR, value::AbstractVecOrMat)
+function _csr_mul!(
+    result::AbstractVecOrMat,
+    matrix::SparseMatrixCSR,
+    value::AbstractVecOrMat,
+    alpha::Number,
+    beta::Number,
+)
     size(matrix, 2) == size(value, 1) ||
         throw(DimensionMismatch("matrix and value dimensions do not match"))
-    T = promote_type(eltype(matrix), eltype(value))
-    output_shape = value isa AbstractVector ?
+    expected_size = value isa AbstractVector ?
         (size(matrix, 1),) :
         (size(matrix, 1), size(value, 2))
-    result = zeros(T, output_shape)
+    size(result) == expected_size ||
+        throw(DimensionMismatch("output has the wrong dimensions"))
+    input = Base.mightalias(result, value) ? copy(value) : value
+    iszero(beta) ? fill!(result, zero(eltype(result))) : lmul!(beta, result)
     if value isa AbstractVector
         for row in 1:matrix.m
-            total = zero(T)
+            total = zero(promote_type(eltype(matrix), eltype(input)))
             for pointer in matrix.rowptr[row]:(matrix.rowptr[row + 1] - 1)
-                total += matrix.nzval[pointer] * value[matrix.colval[pointer]]
+                total += matrix.nzval[pointer] * input[matrix.colval[pointer]]
             end
-            result[row] = total
+            result[row] += alpha * total
         end
     else
         for row in 1:matrix.m
             for pointer in matrix.rowptr[row]:(matrix.rowptr[row + 1] - 1)
                 column = matrix.colval[pointer]
-                @views result[row, :] .+= matrix.nzval[pointer] .* value[column, :]
+                coefficient = alpha * matrix.nzval[pointer]
+                @inbounds for rhs in axes(input, 2)
+                    result[row, rhs] += coefficient * input[column, rhs]
+                end
+            end
+        end
+    end
+    return result
+end
+
+function _csr_mul(matrix::SparseMatrixCSR, value::AbstractVector)
+    T = promote_type(eltype(matrix), eltype(value))
+    result = zeros(T, size(matrix, 1))
+    for row in 1:matrix.m
+        total = zero(T)
+        for pointer in matrix.rowptr[row]:(matrix.rowptr[row + 1] - 1)
+            total += matrix.nzval[pointer] * value[matrix.colval[pointer]]
+        end
+        result[row] = total
+    end
+    return result
+end
+
+function _csr_mul(matrix::SparseMatrixCSR, value::AbstractMatrix)
+    T = promote_type(eltype(matrix), eltype(value))
+    result = zeros(T, size(matrix, 1), size(value, 2))
+    for row in 1:matrix.m
+        for pointer in matrix.rowptr[row]:(matrix.rowptr[row + 1] - 1)
+            column = matrix.colval[pointer]
+            coefficient = matrix.nzval[pointer]
+            @inbounds for rhs in axes(value, 2)
+                result[row, rhs] += coefficient * value[column, rhs]
             end
         end
     end
@@ -116,6 +155,30 @@ Base.:*(matrix::SparseMatrixCSR{T}, value::AbstractVector{S}) where {T,S} =
     _csr_mul(matrix, value)
 Base.:*(matrix::SparseMatrixCSR{T}, value::AbstractMatrix{S}) where {T,S} =
     _csr_mul(matrix, value)
+LinearAlgebra.mul!(
+    result::AbstractVector,
+    matrix::SparseMatrixCSR,
+    value::AbstractVector,
+) = _csr_mul!(result, matrix, value, true, false)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::SparseMatrixCSR,
+    value::AbstractMatrix,
+) = _csr_mul!(result, matrix, value, true, false)
+LinearAlgebra.mul!(
+    result::AbstractVector,
+    matrix::SparseMatrixCSR,
+    value::AbstractVector,
+    alpha::Number,
+    beta::Number,
+) = _csr_mul!(result, matrix, value, alpha, beta)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::SparseMatrixCSR,
+    value::AbstractMatrix,
+    alpha::Number,
+    beta::Number,
+) = _csr_mul!(result, matrix, value, alpha, beta)
 
 Base.transpose(matrix::SparseMatrixCSR) = SparseMatrixCSR(transpose(sparse(matrix)))
 Base.adjoint(matrix::SparseMatrixCSR) = SparseMatrixCSR(adjoint(sparse(matrix)))
@@ -216,24 +279,66 @@ SparseArrays.nnz(matrix::DIAMatrix) =
     sum(count(!iszero, diagonal) for diagonal in matrix.diagonals)
 SparseArrays.SparseMatrixCSC(matrix::DIAMatrix) = sparse(matrix)
 
-function _dia_mul(matrix::DIAMatrix, value::AbstractVecOrMat)
+function _dia_mul!(
+    result::AbstractVecOrMat,
+    matrix::DIAMatrix,
+    value::AbstractVecOrMat,
+    alpha::Number,
+    beta::Number,
+)
     size(matrix, 2) == size(value, 1) ||
         throw(DimensionMismatch("matrix and value dimensions do not match"))
-    T = promote_type(eltype(matrix), eltype(value))
-    output_shape = value isa AbstractVector ?
+    expected_size = value isa AbstractVector ?
         (size(matrix, 1),) :
         (size(matrix, 1), size(value, 2))
-    result = zeros(T, output_shape)
+    size(result) == expected_size ||
+        throw(DimensionMismatch("output has the wrong dimensions"))
+    input = Base.mightalias(result, value) ? copy(value) : value
+    iszero(beta) ? fill!(result, zero(eltype(result))) : lmul!(beta, result)
     for (offset, diagonal) in zip(matrix.offsets, matrix.diagonals)
         first_row = max(1, 1 - offset)
         for (index, coefficient) in pairs(diagonal)
             iszero(coefficient) && continue
             row = first_row + index - 1
             column = row + offset
-            if value isa AbstractVector
-                result[row] += coefficient * value[column]
+            scaled_coefficient = alpha * coefficient
+            if input isa AbstractVector
+                result[row] += scaled_coefficient * input[column]
             else
-                @views result[row, :] .+= coefficient .* value[column, :]
+                @inbounds for rhs in axes(input, 2)
+                    result[row, rhs] += scaled_coefficient * input[column, rhs]
+                end
+            end
+        end
+    end
+    return result
+end
+
+function _dia_mul(matrix::DIAMatrix, value::AbstractVector)
+    T = promote_type(eltype(matrix), eltype(value))
+    result = zeros(T, size(matrix, 1))
+    for (offset, diagonal) in zip(matrix.offsets, matrix.diagonals)
+        first_row = max(1, 1 - offset)
+        for (index, coefficient) in pairs(diagonal)
+            iszero(coefficient) && continue
+            row = first_row + index - 1
+            result[row] += coefficient * value[row + offset]
+        end
+    end
+    return result
+end
+
+function _dia_mul(matrix::DIAMatrix, value::AbstractMatrix)
+    T = promote_type(eltype(matrix), eltype(value))
+    result = zeros(T, size(matrix, 1), size(value, 2))
+    for (offset, diagonal) in zip(matrix.offsets, matrix.diagonals)
+        first_row = max(1, 1 - offset)
+        for (index, coefficient) in pairs(diagonal)
+            iszero(coefficient) && continue
+            row = first_row + index - 1
+            column = row + offset
+            @inbounds for rhs in axes(value, 2)
+                result[row, rhs] += coefficient * value[column, rhs]
             end
         end
     end
@@ -244,6 +349,30 @@ Base.:*(matrix::DIAMatrix{T}, value::AbstractVector{S}) where {T,S} =
     _dia_mul(matrix, value)
 Base.:*(matrix::DIAMatrix{T}, value::AbstractMatrix{S}) where {T,S} =
     _dia_mul(matrix, value)
+LinearAlgebra.mul!(
+    result::AbstractVector,
+    matrix::DIAMatrix,
+    value::AbstractVector,
+) = _dia_mul!(result, matrix, value, true, false)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::DIAMatrix,
+    value::AbstractMatrix,
+) = _dia_mul!(result, matrix, value, true, false)
+LinearAlgebra.mul!(
+    result::AbstractVector,
+    matrix::DIAMatrix,
+    value::AbstractVector,
+    alpha::Number,
+    beta::Number,
+) = _dia_mul!(result, matrix, value, alpha, beta)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::DIAMatrix,
+    value::AbstractMatrix,
+    alpha::Number,
+    beta::Number,
+) = _dia_mul!(result, matrix, value, alpha, beta)
 
 Base.transpose(matrix::DIAMatrix) = DIAMatrix(transpose(sparse(matrix)))
 Base.adjoint(matrix::DIAMatrix) = DIAMatrix(adjoint(sparse(matrix)))

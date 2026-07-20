@@ -36,10 +36,14 @@ function Base.getproperty(basis::TensorBasis, name::Symbol)
     return getfield(basis, name)
 end
 
-projection_matrix(basis::TensorBasis, ::Type{T}=Float64) where {T<:Number} =
+projection_matrix(
+    basis::TensorBasis,
+    ::Type{T}=Float64;
+    sparse::Bool=false,
+) where {T<:Number} =
     kron(
-        projection_matrix(basis.basis_left, T),
-        projection_matrix(basis.basis_right, T),
+        projection_matrix(basis.basis_left, T; sparse),
+        projection_matrix(basis.basis_right, T; sparse),
     )
 
 function project_from(
@@ -49,7 +53,11 @@ function project_from(
 )
     size(vector, 1) == length(basis) ||
         throw(DimensionMismatch("the first vector dimension must equal Ns"))
-    return projection_matrix(basis, eltype(vector)) * vector
+    return projection_matrix(
+        basis,
+        eltype(vector);
+        sparse=get(kwargs, :sparse, true),
+    ) * vector
 end
 
 get_vec(basis::TensorBasis, vector::AbstractVecOrMat; kwargs...) =
@@ -67,7 +75,11 @@ function state_index(
     return (left_index - 1) * length(basis.basis_right) + right_index
 end
 
-function _tensor_reductions(basis::TensorBasis, state::AbstractVector)
+function _tensor_reductions(
+    basis::TensorBasis,
+    state::AbstractVector,
+    return_rdm=:both,
+)
     length(state) == length(basis) ||
         throw(DimensionMismatch("state length must equal Ns"))
     coefficients = reshape(
@@ -75,25 +87,58 @@ function _tensor_reductions(basis::TensorBasis, state::AbstractVector)
         length(basis.basis_right),
         length(basis.basis_left),
     )
-    return coefficients' * coefficients, coefficients * coefficients'
+    if return_rdm in (:A, "A", :left, "left")
+        return coefficients' * coefficients
+    elseif return_rdm in (:B, "B", :right, "right")
+        return coefficients * coefficients'
+    elseif return_rdm in (:both, "both")
+        return coefficients' * coefficients, coefficients * coefficients'
+    end
+    throw(ArgumentError("return_rdm must be A, B, left, right, or both"))
 end
 
-function _tensor_reductions(basis::TensorBasis, state::AbstractMatrix)
+function _tensor_reductions(
+    basis::TensorBasis,
+    state::AbstractMatrix,
+    return_rdm=:both,
+)
     size(state) == (length(basis), length(basis)) ||
         throw(DimensionMismatch("density matrix must match Ns"))
     left_dimension = length(basis.basis_left)
     right_dimension = length(basis.basis_right)
-    rho_left = zeros(eltype(state), left_dimension, left_dimension)
-    rho_right = zeros(eltype(state), right_dimension, right_dimension)
-    for left_row in 1:left_dimension, left_column in 1:left_dimension,
-        right_row in 1:right_dimension, right_column in 1:right_dimension
-        row = state_index(basis, left_row, right_row)
-        column = state_index(basis, left_column, right_column)
-        value = state[row, column]
-        right_row == right_column && (rho_left[left_row, left_column] += value)
-        left_row == left_column && (rho_right[right_row, right_column] += value)
+    need_left = return_rdm in (:A, "A", :left, "left", :both, "both")
+    need_right = return_rdm in (:B, "B", :right, "right", :both, "both")
+    need_left || need_right ||
+        throw(ArgumentError("return_rdm must be A, B, left, right, or both"))
+    rho_left = need_left ?
+        zeros(eltype(state), left_dimension, left_dimension) :
+        nothing
+    rho_right = need_right ?
+        zeros(eltype(state), right_dimension, right_dimension) :
+        nothing
+    reshaped = reshape(
+        state,
+        right_dimension,
+        left_dimension,
+        right_dimension,
+        left_dimension,
+    )
+    if need_left
+        for left_row in 1:left_dimension, left_column in 1:left_dimension,
+            right in 1:right_dimension
+            rho_left[left_row, left_column] +=
+                reshaped[right, left_row, right, left_column]
+        end
     end
-    return rho_left, rho_right
+    if need_right
+        for right_row in 1:right_dimension, right_column in 1:right_dimension,
+            left in 1:left_dimension
+            rho_right[right_row, right_column] +=
+                reshaped[right_row, left, right_column, left]
+        end
+    end
+    return need_left && need_right ? (rho_left, rho_right) :
+           need_left ? rho_left : rho_right
 end
 
 function partial_trace(
@@ -103,11 +148,7 @@ function partial_trace(
     return_rdm=:A,
     kwargs...,
 )
-    rho_left, rho_right = _tensor_reductions(basis, state)
-    return return_rdm in (:A, "A", :left, "left") ? rho_left :
-           return_rdm in (:B, "B", :right, "right") ? rho_right :
-           return_rdm in (:both, "both") ? (rho_left, rho_right) :
-           throw(ArgumentError("return_rdm must be A, B, left, right, or both"))
+    return _tensor_reductions(basis, state, return_rdm)
 end
 
 function ent_entropy(
@@ -133,12 +174,16 @@ function operator_matrix(
     basis::TensorBasis,
     opstring::AbstractString,
     couplings,
+    ;
+    sparse::Bool=false,
 )
     pieces = split(opstring, "|"; keepempty=true)
     length(pieces) == 2 ||
         throw(ArgumentError("tensor operator strings require one '|' separator"))
     left_op, right_op = pieces
-    matrix = zeros(ComplexF64, length(basis), length(basis))
+    matrix = sparse ?
+        spzeros(ComplexF64, length(basis), length(basis)) :
+        zeros(ComplexF64, length(basis), length(basis))
     for coupling in couplings
         sites = coupling[2:end]
         length(sites) == length(left_op) + length(right_op) ||
@@ -146,20 +191,30 @@ function operator_matrix(
         left_sites = sites[1:length(left_op)]
         right_sites = sites[(length(left_op) + 1):end]
         left = isempty(left_op) ?
+            sparse ?
+            spdiagm(0 => ones(ComplexF64, length(basis.basis_left))) :
             Matrix{ComplexF64}(I, length(basis.basis_left), length(basis.basis_left)) :
             operator_matrix(
                 basis.basis_left,
                 left_op,
                 [(first(coupling), left_sites...)],
+                sparse=sparse,
             )
         right = isempty(right_op) ?
+            sparse ?
+            spdiagm(0 => ones(ComplexF64, length(basis.basis_right))) :
             Matrix{ComplexF64}(I, length(basis.basis_right), length(basis.basis_right)) :
             operator_matrix(
                 basis.basis_right,
                 right_op,
                 [(one(first(coupling)), right_sites...)],
+                sparse=sparse,
             )
-        matrix .+= kron(left, right)
+        if sparse
+            matrix += kron(left, right)
+        else
+            matrix .+= kron(left, right)
+        end
     end
     return matrix
 end
@@ -167,7 +222,12 @@ end
 function inplace_op!(out, basis::TensorBasis, opstring, couplings)
     size(out) == (length(basis), length(basis)) ||
         throw(DimensionMismatch("out must have shape (Ns,Ns)"))
-    out .+= operator_matrix(basis, opstring, couplings)
+    out .+= operator_matrix(
+        basis,
+        opstring,
+        couplings;
+        sparse=true,
+    )
     return out
 end
 
@@ -217,8 +277,12 @@ function Base.getproperty(basis::PhotonBasis, name::Symbol)
     return getfield(basis, name)
 end
 
-projection_matrix(basis::PhotonBasis, ::Type{T}=Float64) where {T<:Number} =
-    projection_matrix(basis.tensor, T)
+projection_matrix(
+    basis::PhotonBasis,
+    ::Type{T}=Float64;
+    sparse::Bool=false,
+) where {T<:Number} =
+    projection_matrix(basis.tensor, T; sparse)
 project_from(basis::PhotonBasis, vector::AbstractVecOrMat; kwargs...) =
     project_from(basis.tensor, vector; kwargs...)
 get_vec(basis::PhotonBasis, vector::AbstractVecOrMat; kwargs...) =
@@ -231,7 +295,11 @@ ent_entropy(basis::PhotonBasis, state::AbstractVecOrMat; kwargs...) =
     ent_entropy(basis.tensor, state; kwargs...)
 state_index(basis::PhotonBasis, particle::Integer, photon::Integer) =
     state_index(basis.tensor, particle, photon)
-operator_matrix(basis::PhotonBasis, opstring, couplings) =
-    operator_matrix(basis.tensor, opstring, couplings)
+operator_matrix(
+    basis::PhotonBasis,
+    opstring,
+    couplings;
+    sparse::Bool=false,
+) = operator_matrix(basis.tensor, opstring, couplings; sparse)
 inplace_op!(out, basis::PhotonBasis, opstring, couplings) =
     inplace_op!(out, basis.tensor, opstring, couplings)
