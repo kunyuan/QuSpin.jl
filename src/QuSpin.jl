@@ -62,11 +62,13 @@ using .Basis:
     state_index,
     states
 using .Operators:
+    DIAMatrix,
     ExpOp,
     Hamiltonian,
     OperatorTerm,
     QuantumLinearOperator,
     QuantumOperator,
+    SparseMatrixCSR,
     anti_commutator,
     as_dense_format,
     aslinearoperator,
@@ -134,6 +136,7 @@ using .Tools:
     expm_multiply_parallel
 
 export Basis, Operators, Tools
+export DIAMatrix, SparseMatrixCSR
 export AbstractBasis, ExpOp, FixedUInt, Hamiltonian, OperatorTerm
 export BosonBasis1D, BosonBasisGeneral
 export PhotonBasis, TensorBasis
