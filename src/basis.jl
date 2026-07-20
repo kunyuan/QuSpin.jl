@@ -1,6 +1,7 @@
 module Basis
 
 using LinearAlgebra
+using SparseArrays
 
 export AbstractBasis, FixedUInt, SpinBasis1D, SpinBasisGeneral
 export BosonBasis1D, BosonBasisGeneral
@@ -21,6 +22,8 @@ export get_amp, make_basis!, make_basis_blocks, normalization
 export op_bra_ket, op_shift_sector, project_to, representative
 
 abstract type AbstractBasis end
+
+include("symmetry_basis.jl")
 
 """
     FixedUInt{W}(value)
@@ -102,6 +105,7 @@ struct SpinBasis1D <: AbstractBasis
     pauli::Bool
     encoded_states::Vector{UInt64}
     lookup::Dict{UInt64,Int}
+    symmetry::SymmetryData
 end
 
 const SpinBasisGeneral = SpinBasis1D
@@ -109,13 +113,33 @@ const SpinBasisGeneral = SpinBasis1D
 function SpinBasis1D(
     L::Integer;
     nup::Union{Nothing,Integer}=nothing,
+    Nup=nothing,
+    m=nothing,
+    S="1/2",
     pauli::Bool=true,
+    a::Integer=1,
+    kblock=nothing,
+    pblock=nothing,
+    zblock=nothing,
+    pzblock=nothing,
+    zAblock=nothing,
+    zBblock=nothing,
 )
     1 <= L <= 63 || throw(ArgumentError("L must be between 1 and 63"))
-    nup === nothing || 0 <= nup <= L ||
+    S in ("1/2", "0.5", 0.5, 1 // 2) ||
+        throw(ArgumentError("SpinBasis1D currently supports spin one-half"))
+    nup !== nothing && Nup !== nothing &&
+        throw(ArgumentError("specify only one of nup and Nup"))
+    selected_nup = nup === nothing ? Nup : nup
+    if m !== nothing
+        selected_nup === nothing ||
+            throw(ArgumentError("m cannot be combined with nup or Nup"))
+        selected_nup = round(Int, (float(m) + 0.5) * L)
+    end
+    selected_nup === nothing || 0 <= selected_nup <= L ||
         throw(ArgumentError("nup must lie between 0 and L"))
 
-    wanted = nup === nothing ? nothing : Int(nup)
+    wanted = selected_nup === nothing ? nothing : Int(selected_nup)
     encoded = UInt64[]
     sizehint!(encoded, wanted === nothing ? 1 << min(Int(L), 20) : 0)
     last_state = (UInt64(1) << Int(L)) - UInt64(1)
@@ -124,7 +148,105 @@ function SpinBasis1D(
         push!(encoded, state)
     end
     lookup = Dict(state => i for (i, state) in pairs(encoded))
-    return SpinBasis1D(Int(L), wanted, pauli, encoded, lookup)
+    blocks = Dict{Symbol,Any}(:nup => wanted, :pauli => pauli)
+    requested = (
+        kblock !== nothing ||
+        pblock !== nothing ||
+        zblock !== nothing ||
+        pzblock !== nothing ||
+        zAblock !== nothing ||
+        zBblock !== nothing
+    )
+    if !requested
+        symmetry = _identity_symmetry_data(encoded, blocks)
+        return SpinBasis1D(Int(L), wanted, pauli, encoded, lookup, symmetry)
+    end
+
+    a > 0 && L % a == 0 ||
+        throw(ArgumentError("a must be a positive divisor of L"))
+    order = Int(L ÷ a)
+    projector = sparse(
+        collect(1:length(encoded)),
+        collect(1:length(encoded)),
+        ones(ComplexF64, length(encoded)),
+        length(encoded),
+        length(encoded),
+    )
+
+    function site_permutation_transform(permutation)
+        return state -> begin
+            transformed = zero(UInt64)
+            for site in 1:Int(L)
+                iszero(state & (UInt64(1) << (site - 1))) && continue
+                transformed |= UInt64(1) << (permutation[site] - 1)
+            end
+            transformed, 1.0 + 0im
+        end
+    end
+    translation = [mod1(site + Int(a), Int(L)) for site in 1:Int(L)]
+    parity = [Int(L) - site + 1 for site in 1:Int(L)]
+
+    if kblock !== nothing
+        momentum = mod(Int(kblock), order)
+        eigenvalue = cis(2π * momentum / order)
+        projector = _cyclic_projector(
+            encoded,
+            lookup,
+            site_permutation_transform(translation),
+            eigenvalue,
+        )
+        blocks[:a] = Int(a)
+        blocks[:kblock] = momentum
+    end
+
+    if pblock !== nothing && kblock !== nothing
+        momentum = mod(Int(kblock), order)
+        (momentum == 0 || (iseven(order) && momentum == order ÷ 2)) ||
+            throw(ArgumentError(
+            "pblock can be combined with kblock only at k=0 or pi",
+        ))
+    end
+
+    flip_mask = (UInt64(1) << Int(L)) - UInt64(1)
+    flip_transform = state -> (xor(state, flip_mask), 1.0 + 0im)
+    parity_transform = site_permutation_transform(parity)
+    compose(first_transform, second_transform) = state -> begin
+        intermediate, first_phase = first_transform(state)
+        transformed, second_phase = second_transform(intermediate)
+        transformed, first_phase * second_phase
+    end
+    odd_mask = sum(UInt64(1) << (site - 1) for site in 1:2:Int(L))
+    even_mask = sum(UInt64(1) << (site - 1) for site in 2:2:Int(L))
+
+    for (name, value, transform) in (
+        (:pblock, pblock, parity_transform),
+        (:zblock, zblock, flip_transform),
+        (:pzblock, pzblock, compose(parity_transform, flip_transform)),
+        (:zAblock, zAblock, state -> (xor(state, odd_mask), 1.0 + 0im)),
+        (:zBblock, zBblock, state -> (xor(state, even_mask), 1.0 + 0im)),
+    )
+        value === nothing && continue
+        value in (-1, 1) ||
+            throw(ArgumentError("$name must be +1 or -1"))
+        symmetry_matrix = _signed_permutation(encoded, lookup, transform)
+        projector = _intersect_eigenspace(
+            projector,
+            symmetry_matrix,
+            ComplexF64(value),
+        )
+        blocks[name] = Int(value)
+    end
+
+    symmetry = _finalize_symmetry_data(encoded, projector, blocks)
+    representatives = _representative_states(encoded, symmetry.projector)
+    return SpinBasis1D(
+        Int(L),
+        wanted,
+        pauli,
+        representatives,
+        Dict(state => index for (index, state) in pairs(representatives)),
+        symmetry,
+    )
 end
 
 Base.length(basis::SpinBasis1D) = length(basis.encoded_states)
@@ -132,20 +254,18 @@ Base.:(==)(left::SpinBasis1D, right::SpinBasis1D) =
     left.L == right.L &&
     left.nup == right.nup &&
     left.pauli == right.pauli &&
-    left.encoded_states == right.encoded_states
+    left.encoded_states == right.encoded_states &&
+    left.symmetry.blocks == right.symmetry.blocks
 states(basis::SpinBasis1D) = copy(basis.encoded_states)
 
 function Base.getproperty(basis::SpinBasis1D, name::Symbol)
     name === :N && return getfield(basis, :L)
     name === :Ns && return length(getfield(basis, :encoded_states))
-    name === :blocks && return Dict(
-        :nup => getfield(basis, :nup),
-        :pauli => getfield(basis, :pauli),
-    )
+    name === :blocks && return copy(getfield(basis, :symmetry).blocks)
     name === :description && return "spin-1/2 chain basis"
     name === :dtype && return UInt64
     name === :noncommuting_bits && return Tuple{Vector{Int},Int}[]
-    name === :operators && return ("I", "z", "+", "-")
+    name === :operators && return ("I", "z", "+", "-", "x", "y")
     name === :sps && return 2
     name === :states && return copy(getfield(basis, :encoded_states))
     return getfield(basis, name)
@@ -155,11 +275,12 @@ function projection_matrix(
     basis::SpinBasis1D,
     ::Type{T}=Float64,
 ) where {T<:Number}
-    projector = zeros(T, 1 << basis.L, length(basis))
-    for (column, state) in pairs(basis.encoded_states)
-        projector[Int(state) + 1, column] = one(T)
-    end
-    return projector
+    return _full_projection_matrix(
+        basis.encoded_states,
+        basis.symmetry,
+        1 << basis.L,
+        T,
+    )
 end
 
 function project_from(
@@ -233,6 +354,11 @@ function _apply_spin_local(
     elseif op == '-'
         occupied || return state, 0.0, false
         return state & ~mask, basis.pauli ? 2.0 : 1.0, true
+    elseif op == 'x'
+        return xor(state, mask), basis.pauli ? 1.0 : 0.5, true
+    elseif op == 'y'
+        scale = basis.pauli ? 1.0 : 0.5
+        return xor(state, mask), occupied ? -im * scale : im * scale, true
     end
     throw(ArgumentError("unsupported spin operator '$op'"))
 end
@@ -242,6 +368,23 @@ function operator_matrix(
     opstring::AbstractString,
     couplings,
 )
+    if _has_symmetry(basis.symmetry)
+        parent_symmetry = _identity_symmetry_data(
+            basis.symmetry.parent_states,
+            Dict(:nup => basis.nup, :pauli => basis.pauli),
+        )
+        parent = SpinBasis1D(
+            basis.L,
+            basis.nup,
+            basis.pauli,
+            copy(basis.symmetry.parent_states),
+            copy(basis.symmetry.parent_lookup),
+            parent_symmetry,
+        )
+        parent_matrix = operator_matrix(parent, opstring, couplings)
+        return Matrix(basis.symmetry.projector' * parent_matrix *
+                      basis.symmetry.projector)
+    end
     matrix = zeros(ComplexF64, length(basis), length(basis))
     for coupling in couplings
         length(coupling) == length(opstring) + 1 ||
@@ -250,7 +393,9 @@ function operator_matrix(
             state = initial
             amplitude = complex(first(coupling))
             alive = true
-            for (op, site) in zip(opstring, coupling[2:end])
+            for (op, site) in Iterators.reverse(
+                collect(zip(opstring, coupling[2:end])),
+            )
                 state, factor, alive = _apply_spin_local(basis, state, op, site)
                 alive || break
                 amplitude *= factor
@@ -350,6 +495,25 @@ function partial_trace(
     enforce_pure::Bool=false,
     kwargs...,
 )
+    if _has_symmetry(basis.symmetry)
+        projector = projection_matrix(basis, ComplexF64)
+        expanded = if state isa AbstractMatrix &&
+                      size(state) == (length(basis), length(basis)) &&
+                      !enforce_pure
+            projector * state * projector'
+        else
+            projector * state
+        end
+        full_basis = SpinBasis1D(basis.L; pauli=basis.pauli)
+        return partial_trace(
+            full_basis,
+            expanded;
+            sub_sys_A,
+            return_rdm,
+            enforce_pure,
+            kwargs...,
+        )
+    end
     sites_A = _subsystem_sites(basis, sub_sys_A)
     if state isa AbstractMatrix && enforce_pure &&
        size(state, 1) == length(basis)

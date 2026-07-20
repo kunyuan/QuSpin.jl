@@ -2,7 +2,7 @@ module Tools
 
 using LinearAlgebra
 using ..Basis: AbstractBasis, FixedUInt, get_basis_type, projection_matrix
-using ..Operators: Hamiltonian, OperatorTerm, toarray
+using ..Operators: Hamiltonian, OperatorTerm, _krylov_expmv, toarray
 import ..Basis: ent_entropy
 import ..Operators: apply, evolve, set_a!
 
@@ -608,7 +608,12 @@ function apply(
             throw(DimensionMismatch("work_array must contain twice as many elements as v"))
     end
     T = promote_type(operator.dtype, eltype(v))
-    result = exp(convert(T, operator.a) .* Matrix{T}(operator.A)) * MatrixOrVector(v, T)
+    result = _krylov_expmv(
+        operator.A,
+        MatrixOrVector(v, T),
+        convert(T, operator.a);
+        tol=tol === nothing ? 1e-12 : tol,
+    )
     overwrite_v || return result
     eltype(v) == eltype(result) ||
         throw(ArgumentError("overwrite_v requires an input with the output dtype"))
@@ -777,10 +782,12 @@ function _step_unitary(matrices, durations)
         throw(ArgumentError("Hamiltonians must be square"))
     unitary = Matrix{ComplexF64}(I, size(first_matrix)...)
     for (H, duration) in zip(matrices, durations)
-        matrix = _floquet_matrix(H)
-        size(matrix) == size(first_matrix) ||
+        operator = H isa Hamiltonian && isempty(H.dynamic_terms) ?
+            H :
+            _floquet_matrix(H)
+        size(operator) == size(first_matrix) ||
             throw(DimensionMismatch("all Hamiltonians must have the same shape"))
-        unitary = exp((-im * duration) .* matrix) * unitary
+        unitary = _krylov_expmv(operator, unitary, -im * duration)
     end
     return unitary
 end
@@ -813,9 +820,13 @@ function Floquet(
         T = float(_dict_get(evolution, :T, sum(dt_list)))
         T, _step_unitary(matrices, dt_list)
     elseif _dict_has(evolution, :H) && _dict_has(evolution, :T)
-        H = _floquet_matrix(_dict_get(evolution, :H))
+        requested_H = _dict_get(evolution, :H)
+        H = requested_H isa Hamiltonian && isempty(requested_H.dynamic_terms) ?
+            requested_H :
+            _floquet_matrix(requested_H)
         T = float(_dict_get(evolution, :T))
-        T, exp((-im * T) .* H)
+        identity = Matrix{ComplexF64}(I, size(H)...)
+        T, _krylov_expmv(H, identity, -im * T)
     else
         throw(ArgumentError("unsupported Floquet evolution dictionary"))
     end
@@ -1035,8 +1046,11 @@ function evolve(
         norm(projected) > 1000eps(Float64) || continue
         active = true
         for (column, time) in pairs(targets)
-            result[:, column] .+= projector *
-                (exp((-im * (time - t0)) .* Matrix(hamiltonian)) * projected)
+            result[:, column] .+= projector * _krylov_expmv(
+                hamiltonian,
+                projected,
+                -im * (time - t0),
+            )
         end
     end
     active || throw(ArgumentError("initial state has no projection onto the selected blocks"))
@@ -1071,10 +1085,15 @@ function block_expm(
         projector, hamiltonian = _block_data(operator, key, basis)
         projected = projector' * psi_0
         norm(projected) > 1000eps(Float64) || continue
-        generator = Matrix(hamiltonian)
-        shift === nothing || (generator += shift * I)
+        generator = shift === nothing ?
+            hamiltonian :
+            Matrix(hamiltonian) + shift * I
         for (column, scale) in pairs(scales)
-            result[:, column] .+= projector * (exp((scale * a) .* generator) * projected)
+            result[:, column] .+= projector * _krylov_expmv(
+                generator,
+                projected,
+                scale * a,
+            )
         end
     end
     output = length(scales) == 1 ? vec(result) : result

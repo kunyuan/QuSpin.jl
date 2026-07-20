@@ -702,14 +702,15 @@ end
     @test toarray(H) == matrix
     @test todense(H) == matrix
     @test Matrix(tocsc(H)) == matrix
-    @test_throws ArgumentError tocsr(H)
+    @test Matrix(tocsr(H)) == matrix
     @test tr(H) == tr(matrix)
     @test update_matrix_formats!(H, :csc, Dict()) === H
     @test H.data isa SparseMatrixCSC
     @test !H.is_dense
     @test update_matrix_formats!(H, :dense, Dict()) === H
     @test H.data isa Matrix
-    @test_throws ArgumentError update_matrix_formats!(H, :csr)
+    @test update_matrix_formats!(H, :csr) === H
+    @test H.data isa SparseMatrixCSR
 end
 
 @testset "QuantumOperator native archive" begin
@@ -762,8 +763,8 @@ end
     @test Matrix(operator.T) == transpose(matrix)
 
     vector = normalize(ComplexF64[1, 2im, -0.5])
-    @test operator * vector == matrix * vector
-    @test apply(operator, vector) == matrix * vector
+    @test operator * vector ≈ matrix * vector atol=3e-16
+    @test apply(operator, vector) ≈ matrix * vector atol=3e-16
     @test right_apply(operator, vector) == vec(transpose(vector) * matrix)
     @test Matrix(conj(operator)) == conj(matrix)
     @test Matrix(transpose(operator)) == transpose(matrix)
@@ -805,7 +806,7 @@ end
     @test toarray(operator; pars) == expected
     @test todense(operator; pars) == expected
     @test Matrix(tocsc(operator; pars)) == expected
-    @test_throws ArgumentError tocsr(operator; pars)
+    @test Matrix(tocsr(operator; pars)) == expected
     @test diagonal(operator; pars) == diag(expected)
     @test tr(operator; pars) == tr(expected)
     @test toarray(operator.H; pars) == expected'
@@ -839,7 +840,9 @@ end
     @test operator.is_dense
     @test update_matrix_formats!(operator, Dict(:z => :csc)) === operator
     @test !operator.is_dense
-    @test_throws ArgumentError update_matrix_formats!(operator, Dict(:x => :csr))
+    @test update_matrix_formats!(operator, Dict(:x => :csr)) === operator
+    @test operator.components[:x] isa SparseMatrixCSR
 end
 
 include("paper_workflows.jl")
+include("completeness_gaps.jl")

@@ -129,7 +129,9 @@ function operator_matrix(
             throw(ArgumentError("operator arity and sites differ"))
         for (column, initial) in pairs(basis.base.encoded_states)
             branches = Dict(initial => complex(first(coupling)))
-            for (op, site) in zip(opstring, coupling[2:end])
+            for (op, site) in Iterators.reverse(
+                collect(zip(opstring, coupling[2:end])),
+            )
                 1 <= site <= basis.N ||
                     throw(ArgumentError("site must lie in 1:$(basis.N)"))
                 definition = _user_operator(basis, op)
