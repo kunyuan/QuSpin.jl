@@ -275,13 +275,77 @@ function _assemble_spin_term!(
     return nothing
 end
 
+function _assemble_spin_diagonal!(
+    diagonal::Vector{T},
+    basis::SpinBasis1D,
+    term::OperatorTerm,
+) where {T}
+    operator_length = length(term.op)
+    for coupling in term.couplings
+        coefficient = convert(T, first(coupling))
+        sites = Base.tail(coupling)
+        for (index, state) in pairs(basis.encoded_states)
+            amplitude = coefficient
+            for operator_index in operator_length:-1:1
+                _, factor, _ = _apply_local(
+                    basis,
+                    state,
+                    term.op[operator_index],
+                    sites[operator_index],
+                )
+                amplitude *= convert(T, factor)
+            end
+            diagonal[index] += amplitude
+        end
+    end
+    return nothing
+end
+
+_spin_term_is_diagonal(term::OperatorTerm) =
+    all(operator -> operator in ('I', 'z'), term.op)
+
 function _assemble(
     basis::AbstractBasis,
     terms::AbstractVector{<:OperatorTerm},
     ::Type{T},
     format=:dense,
 ) where {T}
-    if !(basis isa SpinBasis1D) || Basis._has_symmetry(basis.symmetry)
+    if basis isa SpinBasis1D && Basis._has_symmetry(basis.symmetry)
+        parent = Basis._spin_parent_basis(basis)
+        parent_matrix = _assemble(parent, terms, T, :csc)
+        projected =
+            basis.symmetry.projector' *
+            parent_matrix *
+            basis.symmetry.projector
+        return _matrix_with_format(projected, T, format)
+    elseif basis isa Basis.DiscreteBasis &&
+           Basis._has_symmetry(basis.symmetry)
+        parent = Basis._discrete_parent_basis(basis)
+        parent_matrix = _assemble(parent, terms, T, :csc)
+        projected =
+            basis.symmetry.projector' *
+            parent_matrix *
+            basis.symmetry.projector
+        return _matrix_with_format(projected, T, format)
+    elseif basis isa Basis.DiscreteBasis
+        rows = Int[]
+        columns = Int[]
+        values = T[]
+        for term in terms
+            term_rows, term_columns, term_values =
+                Basis._discrete_operator_triplets(
+                    basis,
+                    term.op,
+                    term.couplings,
+                )
+            append!(rows, term_rows)
+            append!(columns, term_columns)
+            append!(values, T.(term_values))
+        end
+        matrix =
+            sparse(rows, columns, values, length(basis), length(basis))
+        return _matrix_with_format(matrix, T, format; copy_data=false)
+    elseif !(basis isa SpinBasis1D)
         matrix = spzeros(ComplexF64, length(basis), length(basis))
         for term in terms
             matrix += sparse(
@@ -298,8 +362,30 @@ function _assemble(
     rows = Int[]
     columns = Int[]
     values = T[]
+    diagonal = zeros(T, length(basis))
+    estimated_nonzeros = length(basis)
     for term in terms
-        _assemble_spin_term!(rows, columns, values, basis, term)
+        _spin_term_is_diagonal(term) && continue
+        changes = count(operator -> operator in ('+', '-'), term.op)
+        divisor = 1 << min(changes, 3)
+        estimated_nonzeros +=
+            length(basis) * length(term.couplings) ÷ divisor
+    end
+    sizehint!(rows, estimated_nonzeros)
+    sizehint!(columns, estimated_nonzeros)
+    sizehint!(values, estimated_nonzeros)
+    for term in terms
+        if _spin_term_is_diagonal(term)
+            _assemble_spin_diagonal!(diagonal, basis, term)
+        else
+            _assemble_spin_term!(rows, columns, values, basis, term)
+        end
+    end
+    for index in eachindex(diagonal)
+        iszero(diagonal[index]) && continue
+        push!(rows, index)
+        push!(columns, index)
+        push!(values, diagonal[index])
     end
     normalized = _normalize_matrix_format(format)
     matrix = sparse(rows, columns, values, length(basis), length(basis))
@@ -916,6 +1002,71 @@ function eigh(H::Hamiltonian; time=0, kwargs...)
     return decomposition.values, decomposition.vectors
 end
 
+struct _PivotedShiftInvert{T,F} <: AbstractMatrix{T}
+    factorization::F
+    dimension::Int
+    hermitian::Bool
+end
+
+Base.size(operator::_PivotedShiftInvert) =
+    (operator.dimension, operator.dimension)
+Base.axes(operator::_PivotedShiftInvert) =
+    (Base.OneTo(operator.dimension), Base.OneTo(operator.dimension))
+LinearAlgebra.ishermitian(operator::_PivotedShiftInvert) =
+    operator.hermitian
+LinearAlgebra.issymmetric(operator::_PivotedShiftInvert{T}) where {T} =
+    operator.hermitian && T <: Real
+
+function LinearAlgebra.mul!(
+    output::AbstractVector,
+    operator::_PivotedShiftInvert,
+    input::AbstractVector,
+)
+    axes(output, 1) == axes(input, 1) == axes(operator, 1) ||
+        throw(DimensionMismatch("shift-invert vector dimensions do not match"))
+    ldiv!(output, operator.factorization, input)
+    return output
+end
+
+function LinearAlgebra.mul!(
+    output::AbstractVector,
+    operator::_PivotedShiftInvert,
+    input::AbstractVector,
+    alpha::Number,
+    beta::Number,
+)
+    if iszero(beta)
+        ldiv!(output, operator.factorization, input)
+        isone(alpha) || rmul!(output, alpha)
+        return output
+    end
+    solved = operator.factorization \ input
+    @. output = alpha * solved + beta * output
+    return output
+end
+
+function Base.:*(
+    operator::_PivotedShiftInvert{T},
+    input::AbstractVector,
+) where {T}
+    output = similar(input, promote_type(T, eltype(input)))
+    return mul!(output, operator, input)
+end
+
+function _pivoted_shift_invert(matrix, sigma, hermitian::Bool)
+    T = promote_type(eltype(matrix), typeof(sigma))
+    shifted = matrix isa SparseMatrixCSC ?
+        SparseMatrixCSC{T,Int}(matrix) :
+        Matrix{T}(matrix)
+    shifted -= sigma * I
+    factorization = lu(shifted)
+    return _PivotedShiftInvert{T,typeof(factorization)}(
+        factorization,
+        size(shifted, 1),
+        hermitian,
+    )
+end
+
 function eigsh(
     H::Hamiltonian;
     time=0,
@@ -925,7 +1076,8 @@ function eigsh(
     kwargs...,
 )
     sigma = get(kwargs, :sigma, nothing)
-    source = if sigma === nothing
+    shift_invert = sigma !== nothing
+    source = if !shift_invert
         aslinearoperator(H; time)
     else
         matrix = _matrix_at(H, time)
@@ -935,7 +1087,7 @@ function eigsh(
             isreal(function_value(time, arguments...))
             for (_, function_value, arguments) in H.dynamic_terms
         )
-        hermitian_at_time ? Hermitian(matrix) : matrix
+        _pivoted_shift_invert(matrix, sigma, hermitian_at_time)
     end
     n = size(source, 1)
     1 <= k <= n || throw(ArgumentError("k must lie in 1:Ns"))
@@ -962,14 +1114,26 @@ function eigsh(
             selected_values
     end
     arpack_which = requested === :SA ? :SR : requested === :LA ? :LR : requested
+    arpack_kwargs = if shift_invert
+        (;
+            (
+                key => value for (key, value) in pairs(kwargs)
+                if key !== :sigma
+            )...,
+        )
+    else
+        kwargs
+    end
     arpack_result = Arpack.eigs(
         source;
         nev=k,
         which=arpack_which,
         ritzvec=return_eigenvectors,
-        kwargs...,
+        arpack_kwargs...,
     )
-    values = arpack_result[1]
+    values = shift_invert ?
+        sigma .+ inv.(arpack_result[1]) :
+        arpack_result[1]
     vectors = return_eigenvectors ? arpack_result[2] : nothing
     order = requested === :SA ?
         sortperm(real.(values)) :
