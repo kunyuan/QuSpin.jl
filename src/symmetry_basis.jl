@@ -9,6 +9,7 @@ struct SymmetryData
     parent_states::Vector{UInt64}
     parent_lookup::Dict{UInt64,Int}
     projector::SparseMatrixCSC{ComplexF64,Int}
+    parent_occupations::Base.RefValue{Union{Nothing,Matrix{Int}}}
     blocks::Dict{Symbol,Any}
     reduced::Bool
 end
@@ -19,23 +20,20 @@ function _identity_symmetry_data(
     lookup::Dict{UInt64,Int}=Dict(
         state => index for (index, state) in pairs(states)
     ),
+    ;
+    parent_occupations=nothing,
 )
-    dimension = length(states)
-    projector = sparse(
-        collect(1:dimension),
-        collect(1:dimension),
-        ones(ComplexF64, dimension),
-        dimension,
-        dimension,
-    )
     return SymmetryData(
         states,
         lookup,
-        projector,
+        spzeros(ComplexF64, 0, 0),
+        Ref{Union{Nothing,Matrix{Int}}}(parent_occupations),
         Dict{Symbol,Any}(blocks),
         false,
     )
 end
+
+const _MAX_DENSE_SYMMETRY_FALLBACK = 512
 
 function _signed_permutation(
     states::Vector{UInt64},
@@ -198,6 +196,13 @@ function _intersect_eigenspace(
         end
     end
 
+    reduced_dimension <= _MAX_DENSE_SYMMETRY_FALLBACK ||
+        throw(ArgumentError(
+            "the requested symmetry intersection requires a dense nullspace " *
+            "of dimension $reduced_dimension; the guarded limit is " *
+            "$_MAX_DENSE_SYMMETRY_FALLBACK. Supply permutation-like symmetry " *
+            "maps or split the symmetry sector before intersecting it.",
+        ))
     represented = Matrix(represented_sparse)
     residual = represented - eigenvalue * I
     vectors = nullspace(residual; atol=2e-10, rtol=2e-10)
@@ -230,6 +235,8 @@ function _finalize_symmetry_data(
     parent_states::Vector{UInt64},
     projector::SparseMatrixCSC,
     blocks,
+    ;
+    parent_occupations=nothing,
 )
     size(projector, 2) > 0 ||
         throw(ArgumentError("the requested symmetry sector is empty"))
@@ -241,6 +248,7 @@ function _finalize_symmetry_data(
         copy(parent_states),
         Dict(state => index for (index, state) in pairs(parent_states)),
         SparseMatrixCSC{ComplexF64,Int}(projector),
+        Ref{Union{Nothing,Matrix{Int}}}(parent_occupations),
         Dict{Symbol,Any}(blocks),
         true,
     )
@@ -292,6 +300,69 @@ function _site_permutation_transform(
     return encoded, phase
 end
 
+function _fermion_site_permutation_phase(
+    state::UInt64,
+    sps::Int,
+    weights::Vector{UInt64},
+    permutation::Vector{Int};
+    spinful::Bool=false,
+)
+    inversions = 0
+    modes = spinful ? 2 * length(permutation) : length(permutation)
+    for left_mode in 1:(modes - 1)
+        left_site = mod1(left_mode, length(permutation))
+        left_digit = Int((state ÷ weights[left_site]) % UInt64(sps))
+        left_occupied = spinful ?
+            (left_mode <= length(permutation) ?
+             (left_digit & 1 == 1) : (left_digit & 2 == 2)) :
+            !iszero(left_digit)
+        left_occupied || continue
+        mapped_left = left_mode <= length(permutation) ?
+            permutation[left_site] :
+            length(permutation) + permutation[left_site]
+        for right_mode in (left_mode + 1):modes
+            right_site = mod1(right_mode, length(permutation))
+            right_digit =
+                Int((state ÷ weights[right_site]) % UInt64(sps))
+            right_occupied = spinful ?
+                (right_mode <= length(permutation) ?
+                 (right_digit & 1 == 1) : (right_digit & 2 == 2)) :
+                !iszero(right_digit)
+            right_occupied || continue
+            mapped_right = right_mode <= length(permutation) ?
+                permutation[right_site] :
+                length(permutation) + permutation[right_site]
+            inversions += mapped_left > mapped_right
+        end
+    end
+    return iseven(inversions) ? 1.0 + 0im : -1.0 + 0im
+end
+
+function _site_permutation_transform(
+    state::UInt64,
+    sps::Int,
+    permutation::Vector{Int},
+    weights::Vector{UInt64};
+    fermionic::Bool=false,
+    spinful::Bool=false,
+)
+    encoded = zero(UInt64)
+    for site in eachindex(permutation)
+        occupation = (state ÷ weights[site]) % UInt64(sps)
+        encoded += occupation * weights[permutation[site]]
+    end
+    phase = fermionic ?
+        _fermion_site_permutation_phase(
+            state,
+            sps,
+            weights,
+            permutation;
+            spinful,
+        ) :
+        1.0 + 0im
+    return encoded, phase
+end
+
 function _full_projection_matrix(
     states::Vector{UInt64},
     symmetry::SymmetryData,
@@ -300,6 +371,18 @@ function _full_projection_matrix(
     ;
     sparse_output::Bool=false,
 ) where {T<:Number}
+    if !symmetry.reduced
+        rows = Int[Int(state) + 1 for state in symmetry.parent_states]
+        values = ones(T, length(rows))
+        projected = sparse(
+            rows,
+            collect(1:length(rows)),
+            values,
+            full_dimension,
+            length(rows),
+        )
+        return sparse_output ? projected : Matrix(projected)
+    end
     parent_projector = symmetry.projector
     rows = Int[
         Int(symmetry.parent_states[row]) + 1
@@ -322,6 +405,77 @@ function _full_projection_matrix(
         values,
     )
     return sparse_output ? projected : Matrix(projected)
+end
+
+function _project_from_full(
+    symmetry::SymmetryData,
+    vector::AbstractVecOrMat,
+    full_dimension::Int,
+)
+    if SparseArrays.issparse(vector)
+        projected = _full_projection_matrix(
+            symmetry.parent_states,
+            symmetry,
+            full_dimension,
+            eltype(vector);
+            sparse_output=true,
+        )
+        return projected * vector
+    end
+    requires_complex = symmetry.reduced &&
+        maximum(abs ∘ imag, nonzeros(symmetry.projector); init=0.0) > 2e-12
+    if eltype(vector) <: Real && requires_complex
+        throw(ArgumentError(
+            "this momentum sector requires a complex projection dtype",
+        ))
+    end
+    parent_coordinates = if symmetry.reduced
+        projected = symmetry.projector * vector
+        eltype(vector) <: Real ? real.(projected) : projected
+    else
+        vector
+    end
+    rows = Int[Int(state) + 1 for state in symmetry.parent_states]
+    if vector isa AbstractVector
+        result = zeros(eltype(parent_coordinates), full_dimension)
+        result[rows] = parent_coordinates
+        return result
+    end
+    result = zeros(
+        eltype(parent_coordinates),
+        full_dimension,
+        size(vector, 2),
+    )
+    result[rows, :] = parent_coordinates
+    return result
+end
+
+function _accumulate_projected_triplets!(
+    output,
+    projector::SparseMatrixCSC,
+    parent_rows,
+    parent_columns,
+    parent_values,
+)
+    adjoint_projector = sparse(adjoint(projector))
+    reduced_rows = rowvals(adjoint_projector)
+    coefficients = nonzeros(adjoint_projector)
+    @inbounds for entry in eachindex(parent_values)
+        parent_row = parent_rows[entry]
+        parent_column = parent_columns[entry]
+        matrix_value = parent_values[entry]
+        for left_pointer in nzrange(adjoint_projector, parent_row)
+            reduced_row = reduced_rows[left_pointer]
+            left_value = coefficients[left_pointer]
+            for right_pointer in nzrange(adjoint_projector, parent_column)
+                reduced_column = reduced_rows[right_pointer]
+                right_value = conj(coefficients[right_pointer])
+                output[reduced_row, reduced_column] +=
+                    left_value * matrix_value * right_value
+            end
+        end
+    end
+    return output
 end
 
 _has_symmetry(data::SymmetryData) = data.reduced

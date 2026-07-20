@@ -184,13 +184,7 @@ function SpinBasis1D(
     a > 0 && L % a == 0 ||
         throw(ArgumentError("a must be a positive divisor of L"))
     order = Int(L ÷ a)
-    projector = sparse(
-        collect(1:length(encoded)),
-        collect(1:length(encoded)),
-        ones(ComplexF64, length(encoded)),
-        length(encoded),
-        length(encoded),
-    )
+    projector = nothing
 
     function site_permutation_transform(permutation)
         return state -> begin
@@ -247,15 +241,27 @@ function SpinBasis1D(
         value === nothing && continue
         value in (-1, 1) ||
             throw(ArgumentError("$name must be +1 or -1"))
-        symmetry_matrix = _signed_permutation(encoded, lookup, transform)
-        projector = _intersect_eigenspace(
-            projector,
-            symmetry_matrix,
-            ComplexF64(value),
-        )
+        projector = if projector === nothing
+            _cyclic_projector(
+                encoded,
+                lookup,
+                transform,
+                ComplexF64(value),
+            )
+        else
+            symmetry_matrix =
+                _signed_permutation(encoded, lookup, transform)
+            _intersect_eigenspace(
+                projector,
+                symmetry_matrix,
+                ComplexF64(value),
+            )
+        end
         blocks[name] = Int(value)
     end
 
+    projector === nothing &&
+        throw(ArgumentError("at least one symmetry block must be specified"))
     symmetry = _finalize_symmetry_data(encoded, projector, blocks)
     representatives = _representative_states(encoded, symmetry.projector)
     return SpinBasis1D(
@@ -305,6 +311,8 @@ function projection_matrix(
     )
 end
 
+_full_projection_dimension(basis::SpinBasis1D) = 1 << basis.L
+
 function project_from(
     basis::SpinBasis1D,
     vector::AbstractVecOrMat;
@@ -313,11 +321,11 @@ function project_from(
 )
     size(vector, 1) == length(basis) ||
         throw(DimensionMismatch("the first vector dimension must equal Ns"))
-    return projection_matrix(
-        basis,
-        eltype(vector);
-        sparse,
-    ) * vector
+    return _project_from_full(
+        basis.symmetry,
+        vector,
+        1 << basis.L,
+    )
 end
 
 get_vec(basis::SpinBasis1D, vector::AbstractVecOrMat; kwargs...) =
@@ -389,38 +397,11 @@ function _apply_spin_local(
     throw(ArgumentError("unsupported spin operator '$op'"))
 end
 
-function operator_matrix(
+function _spin_operator_triplets(
     basis::SpinBasis1D,
     opstring::AbstractString,
     couplings,
-    ;
-    sparse::Bool=false,
 )
-    if _has_symmetry(basis.symmetry)
-        parent_symmetry = _identity_symmetry_data(
-            basis.symmetry.parent_states,
-            Dict(:nup => basis.nup, :pauli => basis.pauli),
-        )
-        parent = SpinBasis1D(
-            basis.L,
-            basis.nup,
-            basis.pauli,
-            copy(basis.symmetry.parent_states),
-            copy(basis.symmetry.parent_lookup),
-            parent_symmetry,
-        )
-        parent_matrix = operator_matrix(
-            parent,
-            opstring,
-            couplings;
-            sparse=true,
-        )
-        projected =
-            basis.symmetry.projector' *
-            parent_matrix *
-            basis.symmetry.projector
-        return sparse ? projected : Matrix(projected)
-    end
     rows = Int[]
     columns = Int[]
     values = ComplexF64[]
@@ -450,6 +431,39 @@ function operator_matrix(
             push!(values, amplitude)
         end
     end
+    return rows, columns, values
+end
+
+function _accumulate_triplets!(out, rows, columns, values)
+    for index in eachindex(values)
+        out[rows[index], columns[index]] += values[index]
+    end
+    return out
+end
+
+function operator_matrix(
+    basis::SpinBasis1D,
+    opstring::AbstractString,
+    couplings,
+    ;
+    sparse::Bool=false,
+)
+    if _has_symmetry(basis.symmetry)
+        parent = _spin_parent_basis(basis)
+        parent_matrix = operator_matrix(
+            parent,
+            opstring,
+            couplings;
+            sparse=true,
+        )
+        projected =
+            basis.symmetry.projector' *
+            parent_matrix *
+            basis.symmetry.projector
+        return sparse ? projected : Matrix(projected)
+    end
+    rows, columns, values =
+        _spin_operator_triplets(basis, opstring, couplings)
     matrix = SparseArrays.sparse(
         rows,
         columns,
@@ -463,12 +477,21 @@ end
 function inplace_op!(out, basis::SpinBasis1D, opstring, couplings)
     size(out) == (length(basis), length(basis)) ||
         throw(DimensionMismatch("out must have shape (Ns,Ns)"))
-    out .+= operator_matrix(
-        basis,
-        opstring,
-        couplings;
-        sparse=true,
-    )
+    if _has_symmetry(basis.symmetry)
+        parent = _spin_parent_basis(basis)
+        rows, columns, values =
+            _spin_operator_triplets(parent, opstring, couplings)
+        return _accumulate_projected_triplets!(
+            out,
+            basis.symmetry.projector,
+            rows,
+            columns,
+            values,
+        )
+    end
+    rows, columns, values =
+        _spin_operator_triplets(basis, opstring, couplings)
+    _accumulate_triplets!(out, rows, columns, values)
     return out
 end
 
@@ -522,6 +545,47 @@ function _reduced_density_matrices(
     throw(ArgumentError("return_rdm must be A, B, or both"))
 end
 
+function _spin_parent_basis(basis::SpinBasis1D)
+    parent_states = basis.symmetry.parent_states
+    parent_lookup = basis.symmetry.parent_lookup
+    blocks = Dict{Symbol,Any}(:nup => basis.nup, :pauli => basis.pauli)
+    return SpinBasis1D(
+        basis.L,
+        basis.nup,
+        basis.pauli,
+        parent_states,
+        parent_lookup,
+        _identity_symmetry_data(parent_states, blocks, parent_lookup),
+    )
+end
+
+function _spin_pure_coefficients(
+    basis::SpinBasis1D,
+    state::AbstractVector,
+    sites_A,
+)
+    parent_basis = basis
+    parent_state = state
+    if _has_symmetry(basis.symmetry)
+        parent_basis = _spin_parent_basis(basis)
+        parent_state = basis.symmetry.projector * state
+    end
+    length(parent_state) == length(parent_basis) ||
+        throw(DimensionMismatch("state length must equal the basis dimension"))
+    sites_B = setdiff(collect(1:parent_basis.L), sites_A)
+    coefficients = zeros(
+        eltype(parent_state),
+        1 << length(sites_A),
+        1 << length(sites_B),
+    )
+    for (position, encoded) in pairs(parent_basis.encoded_states)
+        row = _subsystem_index(encoded, sites_A)
+        column = _subsystem_index(encoded, sites_B)
+        coefficients[row, column] = parent_state[position]
+    end
+    return coefficients
+end
+
 function _reduced_density_matrices(
     basis::SpinBasis1D,
     state::AbstractMatrix,
@@ -549,17 +613,32 @@ function _reduced_density_matrices(
         _subsystem_index(encoded, sites_B)
         for encoded in basis.encoded_states
     ]
-    for row_position in eachindex(basis.encoded_states)
-        row_A = indices_A[row_position]
-        row_B = indices_B[row_position]
-        for column_position in eachindex(basis.encoded_states)
-            column_A = indices_A[column_position]
-            column_B = indices_B[column_position]
-            value = state[row_position, column_position]
-            need_A && row_B == column_B &&
-                (rho_A[row_A, column_A] += value)
-            need_B && row_A == column_A &&
-                (rho_B[row_B, column_B] += value)
+    if need_A
+        groups_B = Dict{Int,Vector{Int}}()
+        for position in eachindex(indices_B)
+            push!(get!(Vector{Int}, groups_B, indices_B[position]), position)
+        end
+        for group in values(groups_B),
+            row_position in group,
+            column_position in group
+            rho_A[
+                indices_A[row_position],
+                indices_A[column_position],
+            ] += state[row_position, column_position]
+        end
+    end
+    if need_B
+        groups_A = Dict{Int,Vector{Int}}()
+        for position in eachindex(indices_A)
+            push!(get!(Vector{Int}, groups_A, indices_A[position]), position)
+        end
+        for group in values(groups_A),
+            row_position in group,
+            column_position in group
+            rho_B[
+                indices_B[row_position],
+                indices_B[column_position],
+            ] += state[row_position, column_position]
         end
     end
     return need_A && need_B ? (rho_A, rho_B) :
@@ -581,7 +660,7 @@ function partial_trace(
     kwargs...,
 )
     if _has_symmetry(basis.symmetry)
-        projector = projection_matrix(basis, ComplexF64)
+        projector = basis.symmetry.projector
         expanded = if state isa AbstractMatrix &&
                       size(state) == (length(basis), length(basis)) &&
                       !enforce_pure
@@ -589,9 +668,8 @@ function partial_trace(
         else
             projector * state
         end
-        full_basis = SpinBasis1D(basis.L; pauli=basis.pauli)
         return partial_trace(
-            full_basis,
+            _spin_parent_basis(basis),
             expanded;
             sub_sys_A,
             return_rdm,
@@ -644,6 +722,18 @@ end
 _entropy_from_density(rho, alpha) =
     _entropy_from_probabilities(_density_eigenvalues(rho), alpha)
 
+const _SCHMIDT_SVD_CROSSOVER = 64
+
+function _schmidt_probabilities(coefficients::AbstractMatrix)
+    if min(size(coefficients)...) <= _SCHMIDT_SVD_CROSSOVER
+        return abs2.(svdvals(coefficients))
+    end
+    gram = size(coefficients, 1) <= size(coefficients, 2) ?
+        coefficients * coefficients' :
+        coefficients' * coefficients
+    return _density_eigenvalues(gram)
+end
+
 """
     ent_entropy(basis, state; ...)
 
@@ -661,13 +751,58 @@ function ent_entropy(
     kwargs...,
 )
     sites_A = _subsystem_sites(basis, sub_sys_A)
-    rho_A, rho_B = partial_trace(
-        basis,
-        state;
-        sub_sys_A=sites_A,
-        return_rdm=:both,
-        enforce_pure,
-    )
+    if state isa AbstractVector
+        coefficients = _spin_pure_coefficients(basis, state, sites_A)
+        schmidt_probabilities = _schmidt_probabilities(coefficients)
+        normalization_A = density && !isempty(sites_A) ? length(sites_A) : 1
+        sites_B = basis.L - length(sites_A)
+        normalization_B = density && sites_B > 0 ? sites_B : 1
+        entropy = _entropy_from_probabilities(
+            schmidt_probabilities,
+            alpha,
+        )
+        result = Dict{String,Any}(
+            "Sent_A" => entropy / normalization_A,
+        )
+        if return_rdm in (:A, "A", :both, "both")
+            result["rdm_A"] = coefficients * coefficients'
+        end
+        if return_rdm in (:B, "B", :both, "both")
+            result["Sent_B"] = entropy / normalization_B
+            result["rdm_B"] = coefficients' * coefficients
+        end
+        if return_rdm_EVs
+            probabilities_A = collect(schmidt_probabilities)
+            append!(
+                probabilities_A,
+                zeros(
+                    eltype(probabilities_A),
+                    max(0, size(coefficients, 1) - length(probabilities_A)),
+                ),
+            )
+            sort!(probabilities_A)
+            result["p_A"] = probabilities_A
+        end
+        return result
+    end
+    need_B = return_rdm in (:B, "B", :both, "both")
+    rho_A, rho_B = if need_B
+        partial_trace(
+            basis,
+            state;
+            sub_sys_A=sites_A,
+            return_rdm=:both,
+            enforce_pure,
+        )
+    else
+        partial_trace(
+            basis,
+            state;
+            sub_sys_A=sites_A,
+            return_rdm=:A,
+            enforce_pure,
+        ), nothing
+    end
     ndims(rho_A) == 2 ||
         throw(ArgumentError("batched pure-state entropy is not yet returned as one call"))
     normalization_A = density && !isempty(sites_A) ? length(sites_A) : 1
@@ -681,7 +816,7 @@ function ent_entropy(
     if return_rdm in (:A, "A", :both, "both")
         result["rdm_A"] = rho_A
     end
-    if return_rdm in (:B, "B", :both, "both")
+    if need_B
         result["Sent_B"] =
             _entropy_from_density(rho_B, alpha) /
             normalization_B

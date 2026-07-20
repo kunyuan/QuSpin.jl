@@ -863,3 +863,6 @@ end
 
 include("paper_workflows.jl")
 include("completeness_gaps.jl")
+include("basis_algorithm_regressions.jl")
+include("operators_algorithm_regressions.jl")
+include("tools_algorithm_regressions.jl")

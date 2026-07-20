@@ -15,24 +15,30 @@ struct SparseMatrixCSR{Tv,Ti<:Integer} <: AbstractMatrix{Tv}
     nzval::Vector{Tv}
 end
 
-function SparseMatrixCSR(matrix::AbstractMatrix{T}) where {T}
-    csc = sparse(matrix)
-    rows, columns, values = findnz(csc)
-    order = sortperm(eachindex(values); by=index -> (rows[index], columns[index]))
-    rowptr = zeros(Int, size(matrix, 1) + 1)
+function SparseMatrixCSR(matrix::SparseMatrixCSC{T,Ti}) where {T,Ti}
+    m, n = size(matrix)
+    rowptr = zeros(Int, m + 1)
     rowptr[1] = 1
-    for index in order
-        rowptr[rows[index] + 1] += 1
+    @inbounds for row in matrix.rowval
+        rowptr[row + 1] += 1
     end
     cumsum!(rowptr, rowptr)
-    return SparseMatrixCSR{T,Int}(
-        size(matrix, 1),
-        size(matrix, 2),
-        rowptr,
-        Int[columns[index] for index in order],
-        T[values[index] for index in order],
-    )
+    next = copy(rowptr)
+    colval = Vector{Int}(undef, nnz(matrix))
+    nzval = Vector{T}(undef, nnz(matrix))
+    @inbounds for column in 1:n
+        for pointer in matrix.colptr[column]:(matrix.colptr[column + 1] - 1)
+            row = matrix.rowval[pointer]
+            destination = next[row]
+            colval[destination] = column
+            nzval[destination] = matrix.nzval[pointer]
+            next[row] += 1
+        end
+    end
+    return SparseMatrixCSR{T,Int}(m, n, rowptr, colval, nzval)
 end
+
+SparseMatrixCSR(matrix::AbstractMatrix) = SparseMatrixCSR(sparse(matrix))
 
 Base.size(matrix::SparseMatrixCSR) = (matrix.m, matrix.n)
 Base.eltype(::Type{SparseMatrixCSR{Tv,Ti}}) where {Tv,Ti} = Tv
@@ -66,20 +72,25 @@ function Base.Matrix(matrix::SparseMatrixCSR{T}) where {T}
 end
 
 function SparseArrays.sparse(matrix::SparseMatrixCSR{T}) where {T}
-    rows = Int[]
-    columns = Int[]
-    values = T[]
-    sizehint!(rows, length(matrix.nzval))
-    sizehint!(columns, length(matrix.nzval))
-    sizehint!(values, length(matrix.nzval))
-    for row in 1:matrix.m
+    colptr = zeros(Int, matrix.n + 1)
+    colptr[1] = 1
+    @inbounds for column in matrix.colval
+        colptr[column + 1] += 1
+    end
+    cumsum!(colptr, colptr)
+    next = copy(colptr)
+    rowval = Vector{Int}(undef, length(matrix.nzval))
+    nzval = Vector{T}(undef, length(matrix.nzval))
+    @inbounds for row in 1:matrix.m
         for pointer in matrix.rowptr[row]:(matrix.rowptr[row + 1] - 1)
-            push!(rows, row)
-            push!(columns, matrix.colval[pointer])
-            push!(values, matrix.nzval[pointer])
+            column = matrix.colval[pointer]
+            destination = next[column]
+            rowval[destination] = row
+            nzval[destination] = matrix.nzval[pointer]
+            next[column] += 1
         end
     end
-    return sparse(rows, columns, values, matrix.m, matrix.n)
+    return SparseMatrixCSC(matrix.m, matrix.n, colptr, rowval, nzval)
 end
 
 SparseArrays.nnz(matrix::SparseMatrixCSR) = length(matrix.nzval)
@@ -180,9 +191,40 @@ LinearAlgebra.mul!(
     beta::Number,
 ) = _csr_mul!(result, matrix, value, alpha, beta)
 
-Base.transpose(matrix::SparseMatrixCSR) = SparseMatrixCSR(transpose(sparse(matrix)))
-Base.adjoint(matrix::SparseMatrixCSR) = SparseMatrixCSR(adjoint(sparse(matrix)))
-Base.conj(matrix::SparseMatrixCSR) = SparseMatrixCSR(conj(sparse(matrix)))
+function _csr_transpose(matrix::SparseMatrixCSR{T}; conjugate::Bool=false) where {T}
+    rowptr = zeros(Int, matrix.n + 1)
+    rowptr[1] = 1
+    @inbounds for column in matrix.colval
+        rowptr[column + 1] += 1
+    end
+    cumsum!(rowptr, rowptr)
+    next = copy(rowptr)
+    colval = Vector{Int}(undef, length(matrix.nzval))
+    nzval = Vector{T}(undef, length(matrix.nzval))
+    @inbounds for row in 1:matrix.m
+        for pointer in matrix.rowptr[row]:(matrix.rowptr[row + 1] - 1)
+            new_row = matrix.colval[pointer]
+            destination = next[new_row]
+            colval[destination] = row
+            nzval[destination] =
+                conjugate ? conj(matrix.nzval[pointer]) : matrix.nzval[pointer]
+            next[new_row] += 1
+        end
+    end
+    return SparseMatrixCSR{T,Int}(matrix.n, matrix.m, rowptr, colval, nzval)
+end
+
+Base.transpose(matrix::SparseMatrixCSR) = _csr_transpose(matrix)
+Base.adjoint(matrix::SparseMatrixCSR) = _csr_transpose(matrix; conjugate=true)
+Base.conj(matrix::SparseMatrixCSR{T}) where {T} = SparseMatrixCSR{T,Int}(
+    matrix.m,
+    matrix.n,
+    copy(matrix.rowptr),
+    copy(matrix.colval),
+    conj.(matrix.nzval),
+)
+LinearAlgebra.ishermitian(matrix::SparseMatrixCSR) =
+    size(matrix, 1) == size(matrix, 2) && sparse(matrix) == adjoint(sparse(matrix))
 
 """
     DIAMatrix(matrix)
@@ -374,6 +416,22 @@ LinearAlgebra.mul!(
     beta::Number,
 ) = _dia_mul!(result, matrix, value, alpha, beta)
 
-Base.transpose(matrix::DIAMatrix) = DIAMatrix(transpose(sparse(matrix)))
-Base.adjoint(matrix::DIAMatrix) = DIAMatrix(adjoint(sparse(matrix)))
-Base.conj(matrix::DIAMatrix) = DIAMatrix(conj(sparse(matrix)))
+function _dia_transpose(matrix::DIAMatrix{T}; conjugate::Bool=false) where {T}
+    offsets = Int[-offset for offset in Iterators.reverse(matrix.offsets)]
+    diagonals = Vector{Vector{T}}(undef, length(matrix.diagonals))
+    for (destination, source) in enumerate(Iterators.reverse(matrix.diagonals))
+        diagonals[destination] = conjugate ? conj.(source) : copy(source)
+    end
+    return DIAMatrix{T,Int}(matrix.n, matrix.m, offsets, diagonals)
+end
+
+Base.transpose(matrix::DIAMatrix) = _dia_transpose(matrix)
+Base.adjoint(matrix::DIAMatrix) = _dia_transpose(matrix; conjugate=true)
+Base.conj(matrix::DIAMatrix{T}) where {T} = DIAMatrix{T,Int}(
+    matrix.m,
+    matrix.n,
+    copy(matrix.offsets),
+    conj.(matrix.diagonals),
+)
+LinearAlgebra.ishermitian(matrix::DIAMatrix) =
+    size(matrix, 1) == size(matrix, 2) && sparse(matrix) == adjoint(sparse(matrix))

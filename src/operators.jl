@@ -68,6 +68,58 @@ mutable struct Hamiltonian{T<:Number}
     terms::Vector{OperatorTerm}
     data::NativeMatrix{T}
     dynamic_terms::Vector{Tuple{NativeMatrix{T},Any,Tuple}}
+    hermitian::Union{Nothing,Bool}
+end
+
+function _consolidate_terms(terms::AbstractVector{<:OperatorTerm})
+    coefficients = Dict{Tuple{String,Tuple},Any}()
+    order = Tuple{String,Tuple}[]
+    for term in terms, coupling in term.couplings
+        key = (term.op, Tuple(coupling[2:end]))
+        haskey(coefficients, key) || push!(order, key)
+        coefficients[key] =
+            get(coefficients, key, zero(first(coupling))) + first(coupling)
+    end
+    grouped = Dict{String,Vector{Tuple}}()
+    op_order = String[]
+    for key in order
+        coefficient = coefficients[key]
+        iszero(coefficient) && continue
+        op, sites = key
+        haskey(grouped, op) || begin
+            grouped[op] = Tuple[]
+            push!(op_order, op)
+        end
+        push!(grouped[op], (coefficient, sites...))
+    end
+    consolidated = OperatorTerm[]
+    for op in op_order
+        entries = grouped[op]
+        coefficient_type =
+            promote_type((typeof(first(entry)) for entry in entries)...)
+        site_type = promote_type(
+            (
+                typeof(site)
+                for entry in entries
+                for site in Base.tail(entry)
+            )...,
+        )
+        arity = length(first(entries)) - 1
+        coupling_type = Core.apply_type(
+            Tuple,
+            coefficient_type,
+            ntuple(_ -> site_type, arity)...,
+        )
+        couplings = Vector{coupling_type}(undef, length(entries))
+        for (index, entry) in pairs(entries)
+            couplings[index] = (
+                convert(coefficient_type, first(entry)),
+                (convert(site_type, site) for site in Base.tail(entry))...,
+            )
+        end
+        push!(consolidated, OperatorTerm(op, couplings))
+    end
+    return consolidated
 end
 
 function _normalize_matrix_format(format; default=:dense)
@@ -130,6 +182,7 @@ function _hamiltonian_from_data(
         OperatorTerm[],
         matrix,
         Tuple{NativeMatrix{eltype(matrix)},Any,Tuple}[],
+        ishermitian(matrix),
     )
 end
 
@@ -229,9 +282,16 @@ function _assemble(
     format=:dense,
 ) where {T}
     if !(basis isa SpinBasis1D) || Basis._has_symmetry(basis.symmetry)
-        matrix = zeros(ComplexF64, length(basis), length(basis))
+        matrix = spzeros(ComplexF64, length(basis), length(basis))
         for term in terms
-            matrix .+= operator_matrix(basis, term.op, term.couplings)
+            matrix += sparse(
+                operator_matrix(
+                    basis,
+                    term.op,
+                    term.couplings;
+                    sparse=true,
+                ),
+            )
         end
         return _matrix_with_format(matrix, T, format)
     end
@@ -255,7 +315,18 @@ function Hamiltonian(
     check_pcon::Bool=true,
 )
     normalized = OperatorTerm[terms...]
-    check_herm && !_matrixfree_is_hermitian(basis, normalized) &&
+    hermitian = if check_herm
+        structural =
+            basis isa Union{SpinBasis1D,Basis.DiscreteBasis{:boson}} ?
+            _structured_is_hermitian(normalized) :
+            nothing
+        structural === nothing ?
+            _matrixfree_is_hermitian(basis, normalized) :
+            structural
+    else
+        nothing
+    end
+    check_herm && !hermitian &&
         throw(ArgumentError("operator list is not Hermitian"))
     check_pcon && !Basis.check_pcon(basis, normalized, Any[]) &&
         throw(ArgumentError("operator list violates the selected particle sector"))
@@ -269,6 +340,7 @@ function Hamiltonian(
         normalized,
         _assemble(basis, normalized, T, static_fmt),
         Tuple{NativeMatrix{T},Any,Tuple}[],
+        hermitian,
     )
 end
 
@@ -328,6 +400,7 @@ function Hamiltonian(
 )
     selected_basis = _basis_from_constructor(N, basis, basis_kwargs)
     terms, matrices = _normalize_operator_terms(static_list)
+    terms = _consolidate_terms(terms)
     static_format = _normalize_matrix_format(static_fmt)
     dynamic_default = dynamic_fmt isa AbstractDict || dynamic_fmt === nothing ?
         static_format :
@@ -391,6 +464,7 @@ function Hamiltonian(
         terms,
         static_matrix,
         dynamic_terms,
+        check_herm ? true : nothing,
     )
 end
 
@@ -421,7 +495,14 @@ LinearAlgebra.mul!(
     alpha::Number,
     beta::Number,
 ) = mul!(output, H.data, value, alpha, beta)
-LinearAlgebra.ishermitian(H::Hamiltonian) = ishermitian(H.data)
+function LinearAlgebra.ishermitian(H::Hamiltonian)
+    if H.hermitian === nothing
+        H.hermitian = ishermitian(H.data)
+    end
+    return H.hermitian::Bool
+end
+LinearAlgebra.issymmetric(H::Hamiltonian) =
+    eltype(H) <: Real && ishermitian(H)
 
 function Base.getproperty(H::Hamiltonian, name::Symbol)
     name === :H && return adjoint(H)
@@ -470,7 +551,16 @@ function _transform_hamiltonian(H::Hamiltonian, transform, function_transform=id
         )
         for (matrix, function_value, arguments) in H.dynamic_terms
     ]
-    return Hamiltonian{T}(H.basis, copy(H.terms), static_matrix, dynamic)
+    transformed_hermitian =
+        H.hermitian === true && transform in (copy, transpose, conj, adjoint) ?
+        true : nothing
+    return Hamiltonian{T}(
+        H.basis,
+        copy(H.terms),
+        static_matrix,
+        dynamic,
+        transformed_hermitian,
+    )
 end
 
 Base.copy(H::Hamiltonian) = _transform_hamiltonian(H, copy)
@@ -537,6 +627,7 @@ function _hamiltonian_with_formats(
         Base.copy(H.terms),
         static_matrix,
         converted_dynamic,
+        H.hermitian,
     )
 end
 
@@ -550,8 +641,101 @@ function as_sparse_format(
 )
     return _hamiltonian_with_formats(H, static_fmt, dynamic_fmt; copy)
 end
-aslinearoperator(H::Hamiltonian; time=0) =
-    isempty(H.dynamic_terms) && iszero(time) ? H : _matrix_at(H, time)
+struct ActionLinearOperator{T,F} <: AbstractMatrix{T}
+    n::Int
+    action!::F
+    hermitian::Bool
+end
+
+Base.size(operator::ActionLinearOperator) = (operator.n, operator.n)
+Base.size(operator::ActionLinearOperator, dimension::Integer) =
+    size(operator)[dimension]
+Base.eltype(::Type{ActionLinearOperator{T,F}}) where {T,F} = T
+Base.eltype(operator::ActionLinearOperator) = eltype(typeof(operator))
+LinearAlgebra.ishermitian(operator::ActionLinearOperator) = operator.hermitian
+LinearAlgebra.issymmetric(operator::ActionLinearOperator) =
+    eltype(operator) <: Real && operator.hermitian
+function LinearAlgebra.mul!(
+    output::AbstractVector,
+    operator::ActionLinearOperator,
+    value::AbstractVector,
+    alpha::Number=true,
+    beta::Number=false,
+)
+    if isone(alpha) && iszero(beta)
+        operator.action!(output, value)
+    else
+        temporary = similar(
+            output,
+            promote_type(eltype(operator), eltype(value)),
+        )
+        operator.action!(temporary, value)
+        iszero(beta) ? fill!(output, zero(eltype(output))) : lmul!(beta, output)
+        axpy!(alpha, temporary, output)
+    end
+    return output
+end
+function LinearAlgebra.mul!(
+    output::AbstractMatrix,
+    operator::ActionLinearOperator,
+    value::AbstractMatrix,
+    alpha::Number=true,
+    beta::Number=false,
+)
+    iszero(beta) ? fill!(output, zero(eltype(output))) : lmul!(beta, output)
+    for column in axes(value, 2)
+        mul!(
+            @view(output[:, column]),
+            operator,
+            @view(value[:, column]),
+            alpha,
+            true,
+        )
+    end
+    return output
+end
+function Base.:*(
+    operator::ActionLinearOperator{T},
+    value::AbstractVector{S},
+) where {T,S}
+    output = zeros(promote_type(T, S), size(operator, 1))
+    return mul!(output, operator, value)
+end
+function Base.:*(
+    operator::ActionLinearOperator{T},
+    value::AbstractMatrix{S},
+) where {T,S}
+    output = zeros(
+        promote_type(T, S),
+        size(operator, 1),
+        size(value, 2),
+    )
+    return mul!(output, operator, value)
+end
+function Base.getindex(operator::ActionLinearOperator{T}, row::Int, column::Int) where {T}
+    input = zeros(T, operator.n)
+    input[column] = one(T)
+    output = operator * input
+    return output[row]
+end
+
+function aslinearoperator(H::Hamiltonian; time=0)
+    isempty(H.dynamic_terms) && iszero(time) && return H
+    T = promote_type(
+        eltype(H),
+        (
+            typeof(function_value(time, arguments...))
+            for (_, function_value, arguments) in H.dynamic_terms
+        )...,
+    )
+    action! = (output, input) ->
+        apply(H, input; time, out=output, overwrite_out=true)
+    hermitian = H.hermitian === true && all(
+        isreal(function_value(time, arguments...))
+        for (_, function_value, arguments) in H.dynamic_terms
+    )
+    return ActionLinearOperator{T,typeof(action!)}(size(H, 1), action!, hermitian)
+end
 check_is_dense(H::Hamiltonian) = H.is_dense
 function astype(
     H::Hamiltonian,
@@ -568,9 +752,21 @@ function astype(
         for (matrix, function_value, arguments) in H.dynamic_terms
     ]
     static_matrix = _matrix_with_format(H.data, T, _storage_format(H.data))
-    return Hamiltonian{T}(H.basis, Base.copy(H.terms), static_matrix, dynamic)
+    return Hamiltonian{T}(
+        H.basis,
+        Base.copy(H.terms),
+        static_matrix,
+        dynamic,
+        H.hermitian,
+    )
 end
-diagonal(H::Hamiltonian; time=0) = diag(_matrix_at(H, time))
+function diagonal(H::Hamiltonian; time=0)
+    result = collect(diag(H.data))
+    for (matrix, function_value, arguments) in H.dynamic_terms
+        result .+= function_value(time, arguments...) .* diag(matrix)
+    end
+    return result
+end
 toarray(H::Hamiltonian; time=0, order=nothing, out=nothing) =
     _copy_or_write(Matrix(_matrix_at(H, time)), out)
 todense(H::Hamiltonian; kwargs...) = toarray(H; kwargs...)
@@ -578,7 +774,7 @@ tocsc(H::Hamiltonian; time=0) = SparseMatrixCSC(_matrix_at(H, time))
 tocsr(H::Hamiltonian; time=0) = SparseMatrixCSR(_matrix_at(H, time))
 
 function _copy_or_write(value, out)
-    out === nothing && return copy(value)
+    out === nothing && return value
     axes(out) == axes(value) ||
         throw(DimensionMismatch("out must have the same axes as the result"))
     copyto!(out, value)
@@ -621,15 +817,10 @@ function apply(
 )
     size(value, 1) == size(H, 2) ||
         throw(DimensionMismatch("Hamiltonian and value dimensions do not match"))
-    coefficients = [
-        function_value(time, arguments...)
-        for (_, function_value, arguments) in H.dynamic_terms
-    ]
     T = promote_type(
         eltype(H),
         eltype(value),
         typeof(a),
-        (typeof(coefficient) for coefficient in coefficients)...,
     )
     result = out === nothing ?
         _action_output(T, size(H, 1), value) :
@@ -642,8 +833,19 @@ function apply(
     input = Base.mightalias(result, value) ? copy(value) : value
     beta = out === nothing || overwrite_out ? zero(a) : one(a)
     _matrix_mul_add!(result, H.data, input, a, beta)
-    for ((matrix, _, _), coefficient) in zip(H.dynamic_terms, coefficients)
+    for (matrix, function_value, arguments) in H.dynamic_terms
+        coefficient = function_value(time, arguments...)
         iszero(coefficient) && continue
+        required_type = promote_type(eltype(result), typeof(a * coefficient))
+        if out === nothing && required_type !== eltype(result)
+            widened = _action_output(
+                required_type,
+                size(H, 1),
+                value,
+            )
+            copyto!(widened, result)
+            result = widened
+        end
         _matrix_mul_add!(result, matrix, input, a * coefficient, true)
     end
     return result
@@ -658,13 +860,52 @@ function right_apply(
     overwrite_out::Bool=true,
     a::Number=1,
 )
-    matrix = _matrix_at(H, time)
-    result = value isa AbstractVector ?
-        a .* vec(transpose(value) * matrix) :
-        a .* (value * matrix)
-    out === nothing && return result
-    overwrite_out ? copyto!(out, result) : (out .+= result)
-    return out
+    size(value, ndims(value)) == size(H, 1) ||
+        throw(DimensionMismatch("value and Hamiltonian dimensions do not match"))
+    T = promote_type(eltype(H), eltype(value), typeof(a))
+    result = out === nothing ? similar(value, T) : out
+    input = Base.mightalias(result, value) ? copy(value) : value
+    beta = out === nothing || overwrite_out ? zero(a) : one(a)
+    _right_matrix_mul_add!(result, input, H.data, a, beta)
+    for (matrix, function_value, arguments) in H.dynamic_terms
+        coefficient = function_value(time, arguments...)
+        iszero(coefficient) && continue
+        _right_matrix_mul_add!(result, input, matrix, a * coefficient, true)
+    end
+    return result
+end
+
+function _right_matrix_mul_add!(output, value, matrix, alpha, beta)
+    if value isa AbstractVector
+        return _matrix_mul_add!(
+            output,
+            transpose(matrix),
+            value,
+            alpha,
+            beta,
+        )
+    end
+    if applicable(
+        mul!,
+        transpose(output),
+        transpose(matrix),
+        transpose(value),
+        alpha,
+        beta,
+    )
+        mul!(
+            transpose(output),
+            transpose(matrix),
+            transpose(value),
+            alpha,
+            beta,
+        )
+        return output
+    end
+    product = value * matrix
+    iszero(beta) ? copyto!(output, alpha .* product) :
+        (@. output = beta * output + alpha * product)
+    return output
 end
 
 function eigh(H::Hamiltonian; time=0, kwargs...)
@@ -683,8 +924,20 @@ function eigsh(
     return_eigenvectors::Bool=true,
     kwargs...,
 )
-    matrix = _matrix_at(H, time)
-    n = size(matrix, 1)
+    sigma = get(kwargs, :sigma, nothing)
+    source = if sigma === nothing
+        aslinearoperator(H; time)
+    else
+        matrix = _matrix_at(H, time)
+        matrix isa Union{SparseMatrixCSR,DIAMatrix} &&
+            (matrix = sparse(matrix))
+        hermitian_at_time = H.hermitian === true && all(
+            isreal(function_value(time, arguments...))
+            for (_, function_value, arguments) in H.dynamic_terms
+        )
+        hermitian_at_time ? Hermitian(matrix) : matrix
+    end
+    n = size(source, 1)
     1 <= k <= n || throw(ArgumentError("k must lie in 1:Ns"))
     requested = Symbol(uppercase(String(which)))
     requested in (:SA, :LA, :SM, :LM, :BE) ||
@@ -709,13 +962,15 @@ function eigsh(
             selected_values
     end
     arpack_which = requested === :SA ? :SR : requested === :LA ? :LR : requested
-    target = ishermitian(matrix) ? Hermitian(matrix) : matrix
-    values, vectors, _, _, _, _ = Arpack.eigs(
-        target;
+    arpack_result = Arpack.eigs(
+        source;
         nev=k,
         which=arpack_which,
+        ritzvec=return_eigenvectors,
         kwargs...,
     )
+    values = arpack_result[1]
+    vectors = return_eigenvectors ? arpack_result[2] : nothing
     order = requested === :SA ?
         sortperm(real.(values)) :
         requested === :LA ?
@@ -726,7 +981,7 @@ function eigsh(
         sortperm(abs.(values); rev=true) :
         eachindex(values)
     ordered_values = values[order]
-    ishermitian(matrix) && (ordered_values = real.(ordered_values))
+    ishermitian(source) && (ordered_values = real.(ordered_values))
     return return_eigenvectors ?
         (ordered_values, vectors[:, order]) :
         ordered_values
@@ -765,25 +1020,49 @@ function _krylov_factorization(
     residual = similar(initial)
     completed = steps
     terminal_norm = 0.0
-    for column in 1:steps
-        _operator_mul!(residual, operator, @view(basis[:, column]))
-        for row in 1:column
-            coefficient = dot(@view(basis[:, row]), residual)
-            hessenberg[row, column] = coefficient
-            axpy!(-coefficient, @view(basis[:, row]), residual)
+    hermitian = ishermitian(operator)
+    if hermitian
+        previous_norm = zero(real(float(one(T))))
+        for column in 1:steps
+            _operator_mul!(residual, operator, @view(basis[:, column]))
+            column > 1 &&
+                axpy!(-previous_norm, @view(basis[:, column - 1]), residual)
+            coefficient = dot(@view(basis[:, column]), residual)
+            hessenberg[column, column] = coefficient
+            axpy!(-coefficient, @view(basis[:, column]), residual)
+            terminal_norm = norm(residual)
+            hessenberg[column + 1, column] = terminal_norm
+            column < steps &&
+                (hessenberg[column, column + 1] = terminal_norm)
+            if terminal_norm <= 100eps(Float64) * max(1.0, norm(hessenberg))
+                completed = column
+                break
+            elseif column < steps
+                @views @. basis[:, column + 1] = residual / terminal_norm
+            end
+            previous_norm = terminal_norm
         end
-        for row in 1:column
-            correction = dot(@view(basis[:, row]), residual)
-            hessenberg[row, column] += correction
-            axpy!(-correction, @view(basis[:, row]), residual)
-        end
-        terminal_norm = norm(residual)
-        hessenberg[column + 1, column] = terminal_norm
-        if terminal_norm <= 100eps(Float64) * max(1.0, norm(hessenberg))
-            completed = column
-            break
-        elseif column < steps
-            @views @. basis[:, column + 1] = residual / terminal_norm
+    else
+        for column in 1:steps
+            _operator_mul!(residual, operator, @view(basis[:, column]))
+            for row in 1:column
+                coefficient = dot(@view(basis[:, row]), residual)
+                hessenberg[row, column] = coefficient
+                axpy!(-coefficient, @view(basis[:, row]), residual)
+            end
+            for row in 1:column
+                correction = dot(@view(basis[:, row]), residual)
+                hessenberg[row, column] += correction
+                axpy!(-correction, @view(basis[:, row]), residual)
+            end
+            terminal_norm = norm(residual)
+            hessenberg[column + 1, column] = terminal_norm
+            if terminal_norm <= 100eps(Float64) * max(1.0, norm(hessenberg))
+                completed = column
+                break
+            elseif column < steps
+                @views @. basis[:, column + 1] = residual / terminal_norm
+            end
         end
     end
     return (
@@ -795,6 +1074,7 @@ function _krylov_factorization(
         terminal_norm=terminal_norm,
         dimension=dimension,
         steps=steps,
+        hermitian=hermitian,
     )
 end
 
@@ -897,22 +1177,65 @@ function _krylov_expmv_times(
         T;
         krylov_dim,
     )
-    for (column, scale) in pairs(scales)
-        if iszero(scale)
-            copyto!(@view(results[:, column]), initial)
-            continue
-        end
-        state, estimate = _krylov_project(factorization, scale)
-        if estimate > tol * max(1.0, norm(state))
-            state = _krylov_expmv_vector(
-                operator,
-                initial,
-                scale;
-                tol,
-                krylov_dim,
+    completed = factorization.completed
+    if factorization.hermitian
+        reduced = Hermitian(
+            Matrix(@view factorization.hessenberg[1:completed, 1:completed]),
+        )
+        decomposition = eigen(reduced)
+        first_coordinates = adjoint(decomposition.vectors)[:, 1]
+        reduced_state = similar(initial)
+        for (column, scale) in pairs(scales)
+            if iszero(scale)
+                copyto!(@view(results[:, column]), initial)
+                continue
+            end
+            coefficients =
+                decomposition.vectors *
+                (exp.(scale .* decomposition.values) .* first_coordinates)
+            mul!(
+                reduced_state,
+                @view(factorization.basis[:, 1:completed]),
+                coefficients,
             )
+            state = factorization.beta .* reduced_state
+            estimate =
+                completed == factorization.steps &&
+                completed < factorization.dimension ?
+                abs(scale) *
+                factorization.terminal_norm *
+                factorization.beta *
+                abs(coefficients[end]) :
+                0.0
+            if estimate > tol * max(1.0, norm(state))
+                state = _krylov_expmv_vector(
+                    operator,
+                    initial,
+                    scale;
+                    tol,
+                    krylov_dim,
+                )
+            end
+            copyto!(@view(results[:, column]), state)
         end
-        copyto!(@view(results[:, column]), state)
+    else
+        for (column, scale) in pairs(scales)
+            if iszero(scale)
+                copyto!(@view(results[:, column]), initial)
+                continue
+            end
+            state, estimate = _krylov_project(factorization, scale)
+            if estimate > tol * max(1.0, norm(state))
+                state = _krylov_expmv_vector(
+                    operator,
+                    initial,
+                    scale;
+                    tol,
+                    krylov_dim,
+                )
+            end
+            copyto!(@view(results[:, column]), state)
+        end
     end
     return results
 end
@@ -928,13 +1251,131 @@ function _krylov_expmv(
 )
     size(value, 1) == size(operator, 2) ||
         throw(DimensionMismatch("operator and matrix dimensions do not match"))
-    return reduce(
-        hcat,
-        (
-            _krylov_expmv_vector(operator, column, scale; kwargs...)
-            for column in eachcol(value)
-        ),
+    T = promote_type(eltype(operator), eltype(value), typeof(scale))
+    result = Matrix{T}(
+        undef,
+        size(value, 1),
+        size(value, 2),
     )
+    for column in axes(value, 2)
+        state = _krylov_expmv_vector(
+            operator,
+            @view(value[:, column]),
+            scale;
+            kwargs...,
+        )
+        copyto!(@view(result[:, column]), state)
+    end
+    return result
+end
+
+function _evolution_derivative(H, value, time, imag_time)
+    left = apply(H, value; time)
+    if value isa AbstractVector
+        return (imag_time ? -one(eltype(left)) : -im) .* left
+    end
+    right = right_apply(H, value; time)
+    return imag_time ?
+        -(left + right) / 2 :
+        -im .* (left - right)
+end
+
+function _rk45_interval(
+    H,
+    initial,
+    start::Real,
+    target::Real,
+    initial_step::Real,
+    max_step::Real,
+    imag_time::Bool;
+    rtol::Real=1e-9,
+    atol::Real=1e-11,
+)
+    state = initial
+    time = float(start)
+    step = min(max_step, max(initial_step, eps(float(target + one(target)))))
+    while time < target
+        step = min(step, target - time)
+        step > eps(max(abs(time), 1.0)) ||
+            throw(ErrorException("adaptive evolution step underflow"))
+        k1 = _evolution_derivative(H, state, time, imag_time)
+        k2 = _evolution_derivative(
+            H,
+            state + step * (1 / 5) * k1,
+            time + step * (1 / 5),
+            imag_time,
+        )
+        k3 = _evolution_derivative(
+            H,
+            state + step * ((3 / 40) * k1 + (9 / 40) * k2),
+            time + step * (3 / 10),
+            imag_time,
+        )
+        k4 = _evolution_derivative(
+            H,
+            state +
+            step *
+            ((44 / 45) * k1 - (56 / 15) * k2 + (32 / 9) * k3),
+            time + step * (4 / 5),
+            imag_time,
+        )
+        k5 = _evolution_derivative(
+            H,
+            state +
+            step *
+            (
+                (19372 / 6561) * k1 -
+                (25360 / 2187) * k2 +
+                (64448 / 6561) * k3 -
+                (212 / 729) * k4
+            ),
+            time + step * (8 / 9),
+            imag_time,
+        )
+        k6 = _evolution_derivative(
+            H,
+            state +
+            step *
+            (
+                (9017 / 3168) * k1 -
+                (355 / 33) * k2 +
+                (46732 / 5247) * k3 +
+                (49 / 176) * k4 -
+                (5103 / 18656) * k5
+            ),
+            time + step,
+            imag_time,
+        )
+        fifth = state +
+            step *
+            (
+                (35 / 384) * k1 +
+                (500 / 1113) * k3 +
+                (125 / 192) * k4 -
+                (2187 / 6784) * k5 +
+                (11 / 84) * k6
+            )
+        k7 = _evolution_derivative(H, fifth, time + step, imag_time)
+        fourth = state +
+            step *
+            (
+                (5179 / 57600) * k1 +
+                (7571 / 16695) * k3 +
+                (393 / 640) * k4 -
+                (92097 / 339200) * k5 +
+                (187 / 2100) * k6 +
+                (1 / 40) * k7
+            )
+        scale = @. atol + rtol * max(abs(state), abs(fifth))
+        error = maximum(abs.(fifth .- fourth) ./ scale; init=0.0)
+        if error <= 1
+            state = fifth
+            time += step
+        end
+        factor = error == 0 ? 5.0 : clamp(0.9 * error^(-1 / 5), 0.2, 5.0)
+        step = min(max_step, step * factor)
+    end
+    return state, step
 end
 
 function evolve(
@@ -953,34 +1394,24 @@ function evolve(
         state = ComplexF64.(v0)
         current = float(t0)
         states = Any[]
+        next_step = max_step
+        rtol = get(kwargs, :rtol, get(kwargs, :tol, 1e-9))
+        atol = get(kwargs, :atol, 1e-11)
         for target in times
             target >= current ||
                 throw(ArgumentError("times must be sorted and not precede t0"))
-            steps = max(1, ceil(Int, (target - current) / max_step))
-            step = (target - current) / steps
-            derivative = if state isa AbstractVector
-                (time, value) -> apply(
-                    H,
-                    value;
-                    time,
-                    a=imag_time ? -1 : -im,
-                )
-            else
-                (time, value) -> begin
-                    matrix = _matrix_at(H, time)
-                    imag_time ?
-                        -(matrix * value + value * matrix) / 2 :
-                        -im .* (matrix * value - value * matrix)
-                end
-            end
-            for _ in 1:steps
-                k1 = derivative(current, state)
-                k2 = derivative(current + step / 2, state + step * k1 / 2)
-                k3 = derivative(current + step / 2, state + step * k2 / 2)
-                k4 = derivative(current + step, state + step * k3)
-                state = state + step * (k1 + 2k2 + 2k3 + k4) / 6
-                current += step
-            end
+            state, next_step = _rk45_interval(
+                H,
+                state,
+                current,
+                float(target),
+                next_step,
+                max_step,
+                imag_time;
+                rtol,
+                atol,
+            )
+            current = float(target)
             if imag_time
                 state = state isa AbstractVector ?
                     state / norm(state) :
@@ -1053,9 +1484,8 @@ function expt_value(H::Hamiltonian, state; time=0, enforce_pure::Bool=false, kwa
     if state isa AbstractVector
         return dot(state, apply(H, state; time))
     elseif ndims(state) == 3
-        matrix = _matrix_at(H, time)
         return [
-            _trace_product(@view(state[:, :, index]), matrix)
+            expt_value(H, @view(state[:, :, index]); time)
             for index in axes(state, 3)
         ]
     elseif enforce_pure || size(state, 2) != size(H, 1)
@@ -1065,7 +1495,12 @@ function expt_value(H::Hamiltonian, state; time=0, enforce_pure::Bool=false, kwa
             for column in axes(state, 2)
         ]
     end
-    return _trace_product(state, _matrix_at(H, time))
+    result = _trace_product(state, H.data)
+    for (matrix, function_value, arguments) in H.dynamic_terms
+        result +=
+            function_value(time, arguments...) * _trace_product(state, matrix)
+    end
+    return result
 end
 
 function matrix_ele(
@@ -1076,12 +1511,12 @@ function matrix_ele(
     diagonal::Bool=false,
     check::Bool=true,
 )
-    elements = left' * _matrix_at(H, time) * right
+    elements = left' * apply(H, right; time)
     return diagonal && elements isa AbstractMatrix ? diag(elements) : elements
 end
 
 function project_to(H::Hamiltonian, projector)
-    P = Matrix(projector)
+    P = projector isa AbstractMatrix ? projector : Matrix(projector)
     projected = if size(H, 1) == size(P, 1)
         P' * H.data * P
     elseif size(H, 1) == size(P, 2)
@@ -1109,9 +1544,9 @@ function quant_fluct(H::Hamiltonian, state; time=0, enforce_pure::Bool=false, kw
         ]
         return second .- mean .^ 2
     end
-    matrix = _matrix_at(H, time)
-    H2 = _hamiltonian_from_data(H.basis, matrix * matrix)
-    second = expt_value(H2, state; time, enforce_pure)
+    first_action = apply(H, state; time)
+    second_action = right_apply(H, first_action; time)
+    second = tr(second_action)
     return second .- mean .^ 2
 end
 
@@ -1147,12 +1582,165 @@ Matrix-free operator backed directly by local basis actions. Construction does
 not assemble a dense or sparse matrix; explicit materialization happens only
 when `Matrix(operator)` is requested.
 """
-mutable struct QuantumLinearOperator{T<:Number} <: AbstractMatrix{T}
-    basis::AbstractBasis
-    static_list::Vector{OperatorTerm}
+mutable struct QuantumLinearOperator{
+    T<:Number,
+    B<:AbstractBasis,
+    SL<:AbstractVector{<:OperatorTerm},
+    AL<:Tuple,
+} <: AbstractMatrix{T}
+    basis::B
+    static_list::SL
+    action_terms::AL
     explicit_data::Union{Nothing,Matrix{T}}
     diagonal::Vector{T}
+    extracted_diagonal::Vector{T}
     hermitian::Bool
+    transposed::Bool
+    conjugated::Bool
+end
+
+_is_structurally_diagonal(op::AbstractString) =
+    all(character -> character in ('I', 'z', 'n', '|'), op)
+
+function _extract_diagonal_terms(basis, terms)
+    remaining = OperatorTerm[]
+    diagonal = zeros(ComplexF64, length(basis))
+    for term in terms
+        if _is_structurally_diagonal(term.op)
+            term_matrix = sparse(
+                operator_matrix(
+                    basis,
+                    term.op,
+                    term.couplings;
+                    sparse=true,
+                ),
+            )
+            diagonal .+= diag(term_matrix)
+        else
+            push!(remaining, term)
+        end
+    end
+    return remaining, diagonal
+end
+
+function _project_parent_diagonal(basis, parent_diagonal)
+    Basis._has_symmetry(basis.symmetry) || return parent_diagonal
+    projector = basis.symmetry.projector
+    result = zeros(eltype(parent_diagonal), size(projector, 2))
+    rows = rowvals(projector)
+    values = nonzeros(projector)
+    @inbounds for column in axes(projector, 2)
+        for pointer in nzrange(projector, column)
+            result[column] +=
+                abs2(values[pointer]) * parent_diagonal[rows[pointer]]
+        end
+    end
+    return result
+end
+
+function _accumulate_spin_diagonal!(
+    diagonal,
+    parent::SpinBasis1D,
+    term::OperatorTerm{C},
+) where {C}
+    operator_length = length(term.op)
+    for coupling in term.couplings
+        sites = Base.tail(coupling)
+        @inbounds for (column, initial_state) in pairs(parent.encoded_states)
+            amplitude = complex(first(coupling))
+            state = initial_state
+            alive = true
+            for operator_index in operator_length:-1:1
+                state, factor, alive = _apply_local(
+                    parent,
+                    state,
+                    term.op[operator_index],
+                    sites[operator_index],
+                )
+                alive || break
+                amplitude *= factor
+            end
+            alive && (diagonal[column] += amplitude)
+        end
+    end
+    return diagonal
+end
+
+function _extract_diagonal_terms(basis::SpinBasis1D, terms)
+    remaining = OperatorTerm[]
+    parent = Basis._has_symmetry(basis.symmetry) ?
+        Basis._parent_basis_for_checks(basis) :
+        basis
+    diagonal = zeros(ComplexF64, length(parent))
+    for term in terms
+        if !_is_structurally_diagonal(term.op)
+            push!(remaining, term)
+            continue
+        end
+        _accumulate_spin_diagonal!(diagonal, parent, term)
+    end
+    return remaining, _project_parent_diagonal(basis, diagonal)
+end
+
+function _accumulate_discrete_diagonal!(
+    diagonal,
+    parent::Basis.DiscreteBasis,
+    term::OperatorTerm{C},
+    weights,
+) where {C}
+    for coupling in term.couplings
+        actions = Basis._operator_actions(
+            parent,
+            term.op,
+            coupling[2:end],
+        )
+        @inbounds for (column, initial_state) in
+                      pairs(parent.encoded_states)
+            amplitude = complex(first(coupling))
+            encoded = initial_state
+            alive = true
+            for (op, site, species) in Iterators.reverse(actions)
+                encoded, factor, alive =
+                    Basis._apply_discrete_encoded_local(
+                        parent,
+                        encoded,
+                        op,
+                        site,
+                        species,
+                        weights[site],
+                        weights,
+                    )
+                alive || break
+                amplitude *= factor
+            end
+            alive && (diagonal[column] += amplitude)
+        end
+    end
+    return diagonal
+end
+
+function _extract_diagonal_terms(basis::Basis.DiscreteBasis, terms)
+    remaining = OperatorTerm[]
+    parent = Basis._has_symmetry(basis.symmetry) ?
+        Basis._parent_basis_for_checks(basis) :
+        basis
+    diagonal = zeros(ComplexF64, length(parent))
+    weights = UInt64[
+        UInt64(parent.sps)^(site - 1) for site in 1:parent.L
+    ]
+    for term in terms
+        if !_is_structurally_diagonal(term.op)
+            push!(remaining, term)
+            continue
+        end
+        _accumulate_discrete_diagonal!(
+            diagonal,
+            parent,
+            term,
+            weights,
+        )
+    end
+    return remaining, _project_parent_diagonal(basis, diagonal)
 end
 
 function QuantumLinearOperator(
@@ -1163,14 +1751,30 @@ function QuantumLinearOperator(
     check_herm::Bool=true,
     check_pcon::Bool=true,
 )
-    normalized = OperatorTerm[static_list...]
-    check_herm && !_matrixfree_is_hermitian(basis, normalized) &&
+    public_terms = OperatorTerm[static_list...]
+    checked_terms = _consolidate_terms(public_terms)
+    normalized, extracted_diagonal = if !check_symm &&
+                                        hasfield(typeof(basis), :symmetry) &&
+                                        Basis._has_symmetry(
+                                            getfield(basis, :symmetry),
+                                        )
+        checked_terms, zeros(ComplexF64, length(basis))
+    else
+        _extract_diagonal_terms(basis, checked_terms)
+    end
+    hermitian =
+        basis isa Union{SpinBasis1D,Basis.DiscreteBasis{:boson}} ?
+        _structured_is_hermitian(checked_terms) :
+        nothing
+    hermitian === nothing &&
+        (hermitian = _matrixfree_is_hermitian(basis, checked_terms))
+    check_herm && !hermitian &&
         throw(ArgumentError("operator list is not Hermitian"))
-    check_pcon && !Basis.check_pcon(basis, normalized, Any[]) &&
+    check_pcon && !Basis.check_pcon(basis, checked_terms, Any[]) &&
         throw(ArgumentError("operator list violates the selected particle sector"))
-    check_symm && !Basis.check_symm(basis, normalized, Any[]) &&
+    check_symm && !Basis.check_symm(basis, checked_terms, Any[]) &&
         throw(ArgumentError("operator list violates the selected symmetry sector"))
-    T = _coefficient_type(normalized)
+    T = _coefficient_type(checked_terms)
     Basis._basis_requires_complex(basis) &&
         (T = promote_type(T, ComplexF64))
     diagonal !== nothing &&
@@ -1182,12 +1786,22 @@ function QuantumLinearOperator(
         throw(DimensionMismatch("diagonal must have length Ns"))
     check_herm && !all(isreal, diagonal_values) &&
         throw(ArgumentError("a Hermitian operator requires a real diagonal"))
-    return QuantumLinearOperator{T}(
+    action_terms = Tuple(normalized)
+    return QuantumLinearOperator{
+        T,
+        typeof(basis),
+        typeof(public_terms),
+        typeof(action_terms),
+    }(
         basis,
-        normalized,
+        public_terms,
+        action_terms,
         nothing,
         diagonal_values,
-        check_herm,
+        Vector{T}(extracted_diagonal),
+        check_herm ? true : hermitian && all(isreal, diagonal_values),
+        false,
+        false,
     )
 end
 
@@ -1197,15 +1811,15 @@ function _apply_spin_term!(
     term::OperatorTerm,
     vector::AbstractVector,
     alpha::Number=1,
+    transposed::Bool=false,
+    conjugated::Bool=false,
 )
     for coupling in term.couplings
         coefficient = alpha * first(coupling)
         sites = Base.tail(coupling)
         operator_length = length(term.op)
         for (column, initial_state) in pairs(basis.encoded_states)
-            input = vector[column]
-            iszero(input) && continue
-            amplitude = input * coefficient
+            amplitude = coefficient
             state = initial_state
             alive = true
             for operator_index in operator_length:-1:1
@@ -1217,7 +1831,12 @@ function _apply_spin_term!(
             end
             alive || continue
             row = get(basis.lookup, state, 0)
-            row == 0 || (result[row] += amplitude)
+            row == 0 && continue
+            transition = conjugated ? conj(amplitude) : amplitude
+            source = transposed ? row : column
+            destination = transposed ? column : row
+            input = vector[source]
+            iszero(input) || (result[destination] += transition * input)
         end
     end
     return result
@@ -1226,26 +1845,53 @@ end
 function _apply_spin_terms!(
     result::AbstractVector,
     basis::SpinBasis1D,
-    terms::Vector{OperatorTerm},
+    terms,
     vector::AbstractVector,
     alpha::Number=1,
+    transposed::Bool=false,
+    conjugated::Bool=false,
 )
     if Basis._has_symmetry(basis.symmetry)
         parent = Basis._parent_basis_for_checks(basis)
-        lifted = basis.symmetry.projector * vector
-        acted = _apply_spin_terms(parent, terms, lifted)
-        mul!(result, basis.symmetry.projector', acted, alpha, true)
+        projector = basis.symmetry.projector
+        ordinary_projection = transposed == conjugated
+        lifted = ordinary_projection ?
+            projector * vector :
+            conj(projector) * vector
+        acted = zeros(
+            promote_type(eltype(lifted), _coefficient_type(terms)),
+            length(parent),
+        )
+        _apply_spin_terms!(
+            acted,
+            parent,
+            terms,
+            lifted,
+            one(alpha),
+            transposed,
+            conjugated,
+        )
+        projection = ordinary_projection ? projector' : transpose(projector)
+        mul!(result, projection, acted, alpha, true)
         return result
     end
     for term in terms
-        _apply_spin_term!(result, basis, term, vector, alpha)
+        _apply_spin_term!(
+            result,
+            basis,
+            term,
+            vector,
+            alpha,
+            transposed,
+            conjugated,
+        )
     end
     return result
 end
 
 function _apply_spin_terms(
     basis::SpinBasis1D,
-    terms::Vector{OperatorTerm},
+    terms,
     vector::AbstractVector,
 )
     T = promote_type(eltype(vector), _coefficient_type(terms))
@@ -1259,7 +1905,12 @@ function _apply_discrete_term!(
     term::OperatorTerm,
     vector::AbstractVector,
     alpha::Number=1,
+    transposed::Bool=false,
+    conjugated::Bool=false,
 )
+    weights = UInt64[
+        UInt64(basis.sps)^(site - 1) for site in 1:basis.L
+    ]
     for coupling in term.couplings
         actions = Basis._operator_actions(
             basis,
@@ -1267,30 +1918,31 @@ function _apply_discrete_term!(
             coupling[2:end],
         )
         coefficient = alpha * first(coupling)
-        for (column, initial_occupations) in enumerate(eachrow(basis.occupations))
-            input = vector[column]
-            iszero(input) && continue
-            occupations = collect(initial_occupations)
-            amplitude = input * coefficient
+        for (column, initial_state) in pairs(basis.encoded_states)
+            encoded = initial_state
+            amplitude = coefficient
             alive = true
             for (op, site, species) in Iterators.reverse(actions)
-                factor, alive = Basis._apply_discrete_local(
+                encoded, factor, alive = Basis._apply_discrete_encoded_local(
                     basis,
-                    occupations,
+                    encoded,
                     op,
                     site,
                     species,
+                    weights[site],
+                    weights,
                 )
                 alive || break
                 amplitude *= factor
             end
             alive || continue
-            encoded = UInt64(sum(
-                occupations[site] * basis.sps^(site - 1)
-                for site in 1:basis.L
-            ))
             row = get(basis.lookup, encoded, 0)
-            row == 0 || (result[row] += amplitude)
+            row == 0 && continue
+            transition = conjugated ? conj(amplitude) : amplitude
+            source = transposed ? row : column
+            destination = transposed ? column : row
+            input = vector[source]
+            iszero(input) || (result[destination] += transition * input)
         end
     end
     return result
@@ -1299,31 +1951,86 @@ end
 function _apply_discrete_terms!(
     result::AbstractVector,
     basis::Basis.DiscreteBasis,
-    terms::Vector{OperatorTerm},
+    terms,
     vector::AbstractVector,
     alpha::Number=1,
+    transposed::Bool=false,
+    conjugated::Bool=false,
 )
     if Basis._has_symmetry(basis.symmetry)
         parent = Basis._parent_basis_for_checks(basis)
-        lifted = basis.symmetry.projector * vector
-        acted = _apply_discrete_terms(parent, terms, lifted)
-        mul!(result, basis.symmetry.projector', acted, alpha, true)
+        projector = basis.symmetry.projector
+        ordinary_projection = transposed == conjugated
+        lifted = ordinary_projection ?
+            projector * vector :
+            conj(projector) * vector
+        acted = zeros(
+            promote_type(eltype(lifted), _coefficient_type(terms)),
+            length(parent),
+        )
+        _apply_discrete_terms!(
+            acted,
+            parent,
+            terms,
+            lifted,
+            one(alpha),
+            transposed,
+            conjugated,
+        )
+        projection = ordinary_projection ? projector' : transpose(projector)
+        mul!(result, projection, acted, alpha, true)
         return result
     end
     for term in terms
-        _apply_discrete_term!(result, basis, term, vector, alpha)
+        _apply_discrete_term!(
+            result,
+            basis,
+            term,
+            vector,
+            alpha,
+            transposed,
+            conjugated,
+        )
     end
     return result
 end
 
 function _apply_discrete_terms(
     basis::Basis.DiscreteBasis,
-    terms::Vector{OperatorTerm},
+    terms,
     vector::AbstractVector,
 )
     T = promote_type(eltype(vector), _coefficient_type(terms))
     result = zeros(T, length(basis))
     return _apply_discrete_terms!(result, basis, terms, vector)
+end
+
+function _apply_user_callback_actions!(
+    result::AbstractVector,
+    basis::Basis.UserBasis,
+    actions::Tuple,
+    vector::AbstractVector,
+    coefficient,
+    transposed::Bool,
+    conjugated::Bool,
+)
+    for (column, initial) in pairs(basis.base.encoded_states)
+        encoded = initial
+        amplitude = complex(coefficient)
+        for (definition, site, _) in actions
+            encoded, factor =
+                Basis._user_callback_entry(definition, encoded, site)
+            amplitude *= factor
+        end
+        row = get(basis.base.lookup, encoded, 0)
+        row == 0 && continue
+        transition = conjugated ? conj(amplitude) : amplitude
+        source = transposed ? row : column
+        destination = transposed ? column : row
+        input = vector[source]
+        iszero(input) || (result[destination] += transition * input)
+    end
+    return result
 end
 
 function _apply_user_term!(
@@ -1332,27 +2039,52 @@ function _apply_user_term!(
     term::OperatorTerm,
     vector::AbstractVector,
     alpha::Number=1,
+    transposed::Bool=false,
+    conjugated::Bool=false,
 )
+    weights = UInt64[
+        UInt64(basis.sps)^(site - 1) for site in 1:basis.N
+    ]
     for coupling in term.couplings
-        actions = collect(zip(term.op, coupling[2:end]))
+        actions = Tuple(
+            (
+                Basis._user_operator(basis, op),
+                Int(site),
+                weights[Int(site)],
+            )
+            for (op, site) in Iterators.reverse(
+                collect(zip(term.op, coupling[2:end])),
+            )
+        )
         coefficient = alpha * first(coupling)
+        if all(action -> action[1] isa Function, actions)
+            _apply_user_callback_actions!(
+                result,
+                basis,
+                actions,
+                vector,
+                coefficient,
+                transposed,
+                conjugated,
+            )
+            continue
+        end
         for (column, initial) in pairs(basis.base.encoded_states)
-            input = vector[column]
-            iszero(input) && continue
-            branches = Dict(initial => complex(input * coefficient))
-            for (op, site) in Iterators.reverse(actions)
-                definition = Basis._user_operator(basis, op)
+            branches = Dict(initial => complex(coefficient))
+            for (definition, site, weight) in actions
                 next_branches = Dict{UInt64,ComplexF64}()
                 for (encoded, amplitude) in branches
                     if definition isa AbstractMatrix
-                        occupations = Basis._digits(encoded, basis.N, basis.sps)
-                        old = occupations[site]
+                        old = Int(
+                            (encoded ÷ weight) %
+                            UInt64(basis.sps),
+                        )
                         for new in 0:(basis.sps - 1)
                             factor = definition[new + 1, old + 1]
                             iszero(factor) && continue
                             updated = UInt64(
-                                Int(encoded) +
-                                (new - old) * basis.sps^(site - 1),
+                                Int128(encoded) +
+                                Int128(new - old) * Int128(weight),
                             )
                             next_branches[updated] =
                                 get(next_branches, updated, 0) + amplitude * factor
@@ -1367,7 +2099,12 @@ function _apply_user_term!(
             end
             for (encoded, amplitude) in branches
                 row = get(basis.base.lookup, encoded, 0)
-                row == 0 || (result[row] += amplitude)
+                row == 0 && continue
+                transition = conjugated ? conj(amplitude) : amplitude
+                source = transposed ? row : column
+                destination = transposed ? column : row
+                input = vector[source]
+                iszero(input) || (result[destination] += transition * input)
             end
         end
     end
@@ -1377,19 +2114,29 @@ end
 function _apply_user_terms!(
     result::AbstractVector,
     basis::Basis.UserBasis,
-    terms::Vector{OperatorTerm},
+    terms,
     vector::AbstractVector,
     alpha::Number=1,
+    transposed::Bool=false,
+    conjugated::Bool=false,
 )
     for term in terms
-        _apply_user_term!(result, basis, term, vector, alpha)
+        _apply_user_term!(
+            result,
+            basis,
+            term,
+            vector,
+            alpha,
+            transposed,
+            conjugated,
+        )
     end
     return result
 end
 
 function _apply_user_terms(
     basis::Basis.UserBasis,
-    terms::Vector{OperatorTerm},
+    terms,
     vector::AbstractVector,
 )
     T = promote_type(eltype(vector), _coefficient_type(terms))
@@ -1397,21 +2144,75 @@ function _apply_user_terms(
     return _apply_user_terms!(result, basis, terms, vector)
 end
 
-_apply_terms!(result, basis::SpinBasis1D, terms, vector, alpha=1) =
-    _apply_spin_terms!(result, basis, terms, vector, alpha)
-_apply_terms!(result, basis::Basis.DiscreteBasis, terms, vector, alpha=1) =
-    _apply_discrete_terms!(result, basis, terms, vector, alpha)
-_apply_terms!(result, basis::Basis.UserBasis, terms, vector, alpha=1) =
-    _apply_user_terms!(result, basis, terms, vector, alpha)
+_apply_terms!(
+    result,
+    basis::SpinBasis1D,
+    terms,
+    vector,
+    alpha=1,
+    transposed=false,
+    conjugated=false,
+) = _apply_spin_terms!(
+    result,
+    basis,
+    terms,
+    vector,
+    alpha,
+    transposed,
+    conjugated,
+)
+_apply_terms!(
+    result,
+    basis::Basis.DiscreteBasis,
+    terms,
+    vector,
+    alpha=1,
+    transposed=false,
+    conjugated=false,
+) = _apply_discrete_terms!(
+    result,
+    basis,
+    terms,
+    vector,
+    alpha,
+    transposed,
+    conjugated,
+)
+_apply_terms!(
+    result,
+    basis::Basis.UserBasis,
+    terms,
+    vector,
+    alpha=1,
+    transposed=false,
+    conjugated=false,
+) = _apply_user_terms!(
+    result,
+    basis,
+    terms,
+    vector,
+    alpha,
+    transposed,
+    conjugated,
+)
 function _apply_terms!(
     result,
     basis::AbstractBasis,
     terms,
     vector,
     alpha=1,
+    transposed=false,
+    conjugated=false,
 )
     for term in terms
-        matrix = Basis.operator_matrix(basis, term.op, term.couplings)
+        matrix = Basis.operator_matrix(
+            basis,
+            term.op,
+            term.couplings;
+            sparse=true,
+        )
+        transposed && (matrix = transpose(matrix))
+        conjugated && (matrix = conj(matrix))
         mul!(result, matrix, vector, alpha, true)
     end
     return result
@@ -1428,6 +2229,36 @@ _apply_terms(basis::AbstractBasis, terms, vector) =
         Basis.operator_matrix(basis, term.op, term.couplings) * vector
         for term in terms
     )
+
+function _structured_is_hermitian(terms)
+    coefficients = Dict{Tuple{String,Tuple},Any}()
+    for term in terms, coupling in term.couplings
+        key = (term.op, Tuple(coupling[2:end]))
+        coefficients[key] =
+            get(coefficients, key, zero(first(coupling))) + first(coupling)
+    end
+    isempty(coefficients) && return true
+    adjoint_character = Dict(
+        'I' => 'I',
+        'x' => 'x',
+        'y' => 'y',
+        'z' => 'z',
+        'n' => 'n',
+        '+' => '-',
+        '-' => '+',
+        '|' => '|',
+    )
+    for ((op, sites), coefficient) in coefficients
+        all(character -> haskey(adjoint_character, character), op) ||
+            return nothing
+        adjoint_op = String([adjoint_character[character] for character in op])
+        partner = get(coefficients, (adjoint_op, sites), nothing)
+        partner === nothing && return false
+        isapprox(partner, conj(coefficient); atol=3e-12, rtol=3e-12) ||
+            return false
+    end
+    return true
+end
 
 function _matrixfree_is_hermitian(basis, terms)
     dimension = length(basis)
@@ -1463,11 +2294,18 @@ function _apply_linear_base(
         _apply_terms!(
             result,
             operator.basis,
-            operator.static_list,
+            operator.action_terms,
             value,
+            1,
+            operator.transposed,
+            operator.conjugated,
         )
     else
-        mul!(result, operator.explicit_data, value)
+        matrix = operator.transposed ?
+            transpose(operator.explicit_data) :
+            operator.explicit_data
+        operator.conjugated && (matrix = conj(matrix))
+        mul!(result, matrix, value)
     end
     return result
 end
@@ -1485,11 +2323,18 @@ function _apply_linear_base(
             _apply_terms!(
                 output,
                 operator.basis,
-                operator.static_list,
+                operator.action_terms,
                 input,
+                1,
+                operator.transposed,
+                operator.conjugated,
             )
         else
-            mul!(output, operator.explicit_data, input)
+            matrix = operator.transposed ?
+                transpose(operator.explicit_data) :
+                operator.explicit_data
+            operator.conjugated && (matrix = conj(matrix))
+            mul!(output, matrix, input)
         end
     end
     return result
@@ -1499,8 +2344,30 @@ function _apply_linear(operator::QuantumLinearOperator, value::AbstractVecOrMat)
     size(value, 1) == length(operator.diagonal) ||
         throw(DimensionMismatch("operator and value dimensions do not match"))
     result = _apply_linear_base(operator, value)
-    result .+= operator.diagonal .* value
+    _add_qlo_diagonal!(result, value, operator, true)
     return result
+end
+
+function _add_qlo_diagonal!(output, input, operator, alpha)
+    if input isa AbstractVector
+        @inbounds for index in eachindex(input)
+            coefficient =
+                operator.diagonal[index] +
+                operator.extracted_diagonal[index]
+            operator.conjugated && (coefficient = conj(coefficient))
+            output[index] += alpha * coefficient * input[index]
+        end
+    else
+        @inbounds for column in axes(input, 2), row in axes(input, 1)
+            coefficient =
+                operator.diagonal[row] +
+                operator.extracted_diagonal[row]
+            operator.conjugated && (coefficient = conj(coefficient))
+            output[row, column] +=
+                alpha * coefficient * input[row, column]
+        end
+    end
+    return output
 end
 
 function _linear_data(operator::QuantumLinearOperator)
@@ -1516,7 +2383,7 @@ Base.size(operator::QuantumLinearOperator) =
     (length(operator.diagonal), length(operator.diagonal))
 Base.size(operator::QuantumLinearOperator, dimension::Integer) =
     size(operator)[dimension]
-Base.eltype(::Type{QuantumLinearOperator{T}}) where {T} = T
+Base.eltype(::Type{<:QuantumLinearOperator{T}}) where {T} = T
 Base.eltype(operator::QuantumLinearOperator) = eltype(typeof(operator))
 Base.:*(
     operator::QuantumLinearOperator{T},
@@ -1548,17 +2415,54 @@ function LinearAlgebra.mul!(
         _apply_terms!(
             output,
             operator.basis,
-            operator.static_list,
+            operator.action_terms,
             input,
             alpha,
+            operator.transposed,
+            operator.conjugated,
         )
     else
-        mul!(output, operator.explicit_data, input, alpha, true)
+        matrix = operator.transposed ?
+            transpose(operator.explicit_data) :
+            operator.explicit_data
+        operator.conjugated && (matrix = conj(matrix))
+        mul!(output, matrix, input, alpha, true)
     end
-    @. output += alpha * operator.diagonal * input
+    _add_qlo_diagonal!(output, input, operator, alpha)
+    return output
+end
+LinearAlgebra.mul!(
+    output::AbstractMatrix,
+    operator::QuantumLinearOperator,
+    value::AbstractMatrix,
+) = mul!(output, operator, value, true, false)
+function LinearAlgebra.mul!(
+    output::AbstractMatrix,
+    operator::QuantumLinearOperator,
+    value::AbstractMatrix,
+    alpha::Number,
+    beta::Number,
+)
+    size(output) == (size(operator, 1), size(value, 2)) ||
+        throw(DimensionMismatch("output has the wrong dimensions"))
+    size(value, 1) == size(operator, 2) ||
+        throw(DimensionMismatch("operator and value dimensions do not match"))
+    input = Base.mightalias(output, value) ? copy(value) : value
+    iszero(beta) ? fill!(output, zero(eltype(output))) : lmul!(beta, output)
+    for column in axes(input, 2)
+        mul!(
+            @view(output[:, column]),
+            operator,
+            @view(input[:, column]),
+            alpha,
+            true,
+        )
+    end
     return output
 end
 LinearAlgebra.ishermitian(operator::QuantumLinearOperator) = operator.hermitian
+LinearAlgebra.issymmetric(operator::QuantumLinearOperator) =
+    eltype(operator) <: Real && operator.hermitian
 
 function Base.getproperty(operator::QuantumLinearOperator, name::Symbol)
     name === :H && return adjoint(operator)
@@ -1576,22 +2480,39 @@ function _linear_from_matrix(
     matrix::AbstractMatrix,
 )
     T = eltype(matrix)
-    return QuantumLinearOperator{T}(
+    static_list = copy(source.static_list)
+    action_terms = copy(source.action_terms)
+    return QuantumLinearOperator{
+        T,
+        typeof(source.basis),
+        typeof(static_list),
+        typeof(action_terms),
+    }(
         source.basis,
-        copy(source.static_list),
+        static_list,
+        action_terms,
         Matrix{T}(matrix),
         zeros(T, size(matrix, 1)),
+        zeros(T, size(matrix, 1)),
         ishermitian(matrix),
+        false,
+        false,
     )
 end
 
 Base.copy(operator::QuantumLinearOperator) = deepcopy(operator)
+function _linear_with_flags(operator::QuantumLinearOperator, toggle_t, toggle_c)
+    result = copy(operator)
+    result.transposed = xor(result.transposed, toggle_t)
+    result.conjugated = xor(result.conjugated, toggle_c)
+    return result
+end
 Base.transpose(operator::QuantumLinearOperator) =
-    _linear_from_matrix(operator, transpose(_linear_data(operator)))
+    _linear_with_flags(operator, true, false)
 Base.conj(operator::QuantumLinearOperator) =
-    _linear_from_matrix(operator, conj(_linear_data(operator)))
+    _linear_with_flags(operator, false, true)
 Base.adjoint(operator::QuantumLinearOperator) =
-    _linear_from_matrix(operator, adjoint(_linear_data(operator)))
+    _linear_with_flags(operator, true, true)
 isquantum_LinearOperator(value) = value isa QuantumLinearOperator
 
 function set_diagonal!(
@@ -1612,8 +2533,12 @@ function apply(
     a::Number=1,
     kwargs...,
 )
-    result = a * (operator * value)
-    return _copy_or_write(result, out)
+    T = promote_type(eltype(operator), eltype(value), typeof(a))
+    result = out === nothing ?
+        _action_output(T, size(operator, 1), value) :
+        out
+    mul!(result, operator, value, a, false)
+    return result
 end
 
 function right_apply(
@@ -1623,10 +2548,43 @@ function right_apply(
     a::Number=1,
     kwargs...,
 )
-    result = value isa AbstractVector ?
-        a .* vec(transpose(value) * _linear_data(operator)) :
-        a .* (value * _linear_data(operator))
-    return _copy_or_write(result, out)
+    if value isa StridedVector{<:LinearAlgebra.BlasFloat} &&
+       size(operator, 1) <= 64
+        T = promote_type(eltype(operator), eltype(value), typeof(a))
+        if T <: LinearAlgebra.BlasFloat
+            result = out === nothing ? zeros(T, size(operator, 2)) : out
+            length(result) == size(operator, 2) ||
+                throw(DimensionMismatch("out must have length Ns"))
+            input = Base.mightalias(result, value) ? copy(value) : value
+            unit = zeros(T, size(operator, 1))
+            column = similar(unit)
+            @inbounds for index in eachindex(result)
+                unit[index] = one(T)
+                mul!(column, operator, unit)
+                result[index] = a * LinearAlgebra.BLAS.dotu(
+                    length(input),
+                    input,
+                    stride(input, 1),
+                    column,
+                    1,
+                )
+                unit[index] = zero(T)
+            end
+            return result
+        end
+    end
+    transposed_operator = transpose(operator)
+    transposed_value =
+        value isa AbstractVector ? value : transpose(value)
+    if value isa AbstractVector
+        return apply(transposed_operator, value; out, a)
+    end
+    T = promote_type(eltype(operator), eltype(value), typeof(a))
+    result = out === nothing ?
+        zeros(T, size(value, 1), size(operator, 2)) :
+        out
+    mul!(transpose(result), transposed_operator, transposed_value, a, false)
+    return result
 end
 
 function eigsh(
@@ -1646,12 +2604,15 @@ function eigsh(
         return eigsh(H; k, which, return_eigenvectors, kwargs...)
     end
     arpack_which = requested === :SA ? :SR : requested === :LA ? :LR : requested
-    values, vectors, _, _, _, _ = Arpack.eigs(
+    arpack_result = Arpack.eigs(
         operator;
         nev=k,
         which=arpack_which,
+        ritzvec=return_eigenvectors,
         kwargs...,
     )
+    values = arpack_result[1]
+    vectors = return_eigenvectors ? arpack_result[2] : nothing
     order = requested === :SA ?
         sortperm(real.(values)) :
         requested === :LA ?
@@ -1680,7 +2641,7 @@ function expt_value(
     elseif enforce_pure || size(state, 2) != size(operator, 1)
         return [dot(column, operator * column) for column in eachcol(state)]
     end
-    return _trace_product(state, _linear_data(operator))
+    return tr(right_apply(operator, state))
 end
 
 function matrix_ele(
@@ -1705,8 +2666,20 @@ function quant_fluct(
         second = dot(state, operator * (operator * state))
         return second - mean^2
     end
-    H = _hamiltonian_from_data(operator.basis, _linear_data(operator))
-    return quant_fluct(H, state; enforce_pure, kwargs...)
+    if ndims(state) == 3
+        return [
+            quant_fluct(
+                operator,
+                @view(state[:, :, index]);
+                enforce_pure,
+                kwargs...,
+            )
+            for index in axes(state, 3)
+        ]
+    end
+    first_action = operator * state
+    second = tr(right_apply(operator, first_action))
+    return second - mean^2
 end
 
 """
@@ -1897,10 +2870,33 @@ tocsc(operator::QuantumOperator; pars::AbstractDict=Dict()) =
 function tocsr(operator::QuantumOperator; pars::AbstractDict=Dict())
     return SparseMatrixCSR(_parameter_matrix(operator, pars))
 end
-diagonal(operator::QuantumOperator; pars::AbstractDict=Dict()) =
-    diag(_parameter_matrix(operator, pars))
-LinearAlgebra.tr(operator::QuantumOperator; pars::AbstractDict=Dict()) =
-    tr(_parameter_matrix(operator, pars))
+function diagonal(operator::QuantumOperator; pars::AbstractDict=Dict())
+    T = promote_type(
+        eltype(operator),
+        (typeof(value) for value in values(pars))...,
+    )
+    result = zeros(T, size(operator, 1))
+    for (key, matrix) in operator.components
+        coefficient = get(pars, key, zero(T))
+        iszero(coefficient) || (result .+= coefficient .* diag(matrix))
+    end
+    return result
+end
+function LinearAlgebra.tr(
+    operator::QuantumOperator;
+    pars::AbstractDict=Dict(),
+)
+    T = promote_type(
+        eltype(operator),
+        (typeof(value) for value in values(pars))...,
+    )
+    result = zero(T)
+    for (key, matrix) in operator.components
+        coefficient = get(pars, key, zero(T))
+        iszero(coefficient) || (result += coefficient * tr(matrix))
+    end
+    return result
+end
 
 function apply(
     operator::QuantumOperator,
@@ -1913,16 +2909,11 @@ function apply(
 )
     size(value, 1) == size(operator, 2) ||
         throw(DimensionMismatch("operator and value dimensions do not match"))
-    component_pairs = collect(operator.components)
-    coefficients = [
-        get(pars, key, zero(eltype(operator)))
-        for (key, _) in component_pairs
-    ]
     T = promote_type(
         eltype(operator),
         eltype(value),
         typeof(a),
-        (typeof(coefficient) for coefficient in coefficients)...,
+        (typeof(coefficient) for coefficient in values(pars))...,
     )
     result = out === nothing ?
         _action_output(T, size(operator, 1), value) :
@@ -1939,7 +2930,8 @@ function apply(
     if out === nothing || overwrite_out
         fill!(result, zero(eltype(result)))
     end
-    for ((_, matrix), coefficient) in zip(component_pairs, coefficients)
+    for (key, matrix) in operator.components
+        coefficient = get(pars, key, zero(T))
         iszero(coefficient) && continue
         _matrix_mul_add!(result, matrix, input, a * coefficient, true)
     end
@@ -1955,13 +2947,62 @@ function right_apply(
     a::Number=1,
     kwargs...,
 )
-    matrix = _parameter_matrix(operator, pars)
-    result = value isa AbstractVector ?
-        a .* vec(transpose(value) * matrix) :
-        a .* (value * matrix)
-    out === nothing && return result
-    overwrite_out ? copyto!(out, result) : (out .+= result)
-    return out
+    T = promote_type(
+        eltype(operator),
+        eltype(value),
+        typeof(a),
+        (typeof(coefficient) for coefficient in values(pars))...,
+    )
+    result = out === nothing ? similar(value, T) : out
+    if value isa StridedVector{<:LinearAlgebra.BlasFloat} &&
+       T <: LinearAlgebra.BlasFloat &&
+       operator.is_dense &&
+       size(operator, 1) <= 64
+        length(result) == size(operator, 2) ||
+            throw(DimensionMismatch("out must have length Ns"))
+        input = Base.mightalias(result, value) ? copy(value) : value
+        column = zeros(T, size(operator, 1))
+        @inbounds for destination in eachindex(result)
+            fill!(column, zero(T))
+            for (key, matrix) in operator.components
+                coefficient = get(pars, key, zero(T))
+                iszero(coefficient) && continue
+                for source in eachindex(column)
+                    column[source] +=
+                        coefficient * matrix[source, destination]
+                end
+            end
+            product = a * LinearAlgebra.BLAS.dotu(
+                length(input),
+                input,
+                stride(input, 1),
+                column,
+                1,
+            )
+            if out === nothing || overwrite_out
+                result[destination] = product
+            else
+                result[destination] += product
+            end
+        end
+        return result
+    end
+    out === nothing || overwrite_out ?
+        fill!(result, zero(eltype(result))) :
+        nothing
+    input = Base.mightalias(result, value) ? copy(value) : value
+    for (key, matrix) in operator.components
+        coefficient = get(pars, key, zero(T))
+        iszero(coefficient) && continue
+        _right_matrix_mul_add!(
+            result,
+            input,
+            matrix,
+            a * coefficient,
+            true,
+        )
+    end
+    return result
 end
 
 function eigh(operator::QuantumOperator; pars::AbstractDict=Dict(), kwargs...)
@@ -2009,14 +3050,30 @@ function aslinearoperator(
     operator::QuantumOperator;
     pars::AbstractDict=Dict(),
 )
-    linear = QuantumLinearOperator(
-        operator.basis,
-        OperatorTerm[];
-        diagonal=zeros(eltype(operator), size(operator, 1)),
+    T = promote_type(
+        eltype(operator),
+        (typeof(value) for value in values(pars))...,
     )
-    return _linear_from_matrix(
-        linear,
-        _parameter_matrix(operator, pars),
+    action! = (output, input) ->
+        apply(
+            operator,
+            input;
+            pars,
+            out=output,
+            overwrite_out=true,
+        )
+    hermitian = all(
+        iszero(get(pars, key, zero(T))) ||
+        (
+            isreal(get(pars, key, zero(T))) &&
+            ishermitian(matrix)
+        )
+        for (key, matrix) in operator.components
+    )
+    return ActionLinearOperator{T,typeof(action!)}(
+        size(operator, 1),
+        action!,
+        hermitian,
     )
 end
 
@@ -2036,14 +3093,28 @@ function expt_value(
             for column in axes(state, 2)
         ]
     end
-    matrix = _parameter_matrix(operator, pars)
     if ndims(state) == 3
         return [
-            _trace_product(@view(state[:, :, index]), matrix)
+            expt_value(
+                operator,
+                @view(state[:, :, index]);
+                pars,
+            )
             for index in axes(state, 3)
         ]
     end
-    return _trace_product(state, matrix)
+    T = promote_type(
+        eltype(operator),
+        eltype(state),
+        (typeof(value) for value in values(pars))...,
+    )
+    result = zero(T)
+    for (key, matrix) in operator.components
+        coefficient = get(pars, key, zero(T))
+        iszero(coefficient) ||
+            (result += coefficient * _trace_product(state, matrix))
+    end
+    return result
 end
 
 function matrix_ele(
@@ -2054,7 +3125,7 @@ function matrix_ele(
     diagonal::Bool=false,
     kwargs...,
 )
-    elements = left' * _parameter_matrix(operator, pars) * right
+    elements = left' * apply(operator, right; pars)
     return diagonal && elements isa AbstractMatrix ? diag(elements) : elements
 end
 
@@ -2080,12 +3151,10 @@ function quant_fluct(
         ]
         return second .- mean .^ 2
     end
-    return quant_fluct(
-        tohamiltonian(operator; pars),
-        state;
-        enforce_pure,
-        kwargs...,
-    )
+    mean = expt_value(operator, state; pars)
+    first_action = apply(operator, state; pars)
+    second = tr(right_apply(operator, first_action; pars))
+    return second - mean^2
 end
 
 function update_matrix_formats!(
@@ -2137,8 +3206,8 @@ end
 Julia-native matrix-exponential action. A configured grid evaluates
 `exp(a * grid[i] * O)` without requiring Python or SciPy.
 """
-mutable struct ExpOp
-    O::Any
+mutable struct ExpOp{M}
+    O::M
     a::Number
     grid::Union{Nothing,Vector{Float64}}
     step::Union{Nothing,Float64}
@@ -2169,8 +3238,7 @@ function ExpOp(
     endpoint=nothing,
     iterate::Bool=false,
 )
-    matrix = _operator_dense(O)
-    size(matrix, 1) == size(matrix, 2) ||
+    size(O, 1) == size(O, 2) ||
         throw(ArgumentError("O must be square"))
     if start === nothing && stop === nothing
         num === nothing && endpoint === nothing ||
@@ -2188,8 +3256,8 @@ end
 function Base.getproperty(operator::ExpOp, name::Symbol)
     name === :H && return adjoint(operator)
     name === :T && return transpose(operator)
-    name === :Ns && return size(_operator_dense(getfield(operator, :O)), 1)
-    name === :get_shape && return size(_operator_dense(getfield(operator, :O)))
+    name === :Ns && return size(getfield(operator, :O), 1)
+    name === :get_shape && return size(getfield(operator, :O))
     name === :ndim && return 2
     return getfield(operator, name)
 end
@@ -2199,15 +3267,15 @@ Base.copy(operator::ExpOp) = deepcopy(operator)
 isexp_op(value) = value isa ExpOp
 
 function Base.transpose(operator::ExpOp)
-    return _copy_exp_with_operator(operator, transpose(_operator_dense(operator.O)), operator.a)
+    return _copy_exp_with_operator(operator, transpose(operator.O), operator.a)
 end
 
 function Base.conj(operator::ExpOp)
-    return _copy_exp_with_operator(operator, conj(_operator_dense(operator.O)), conj(operator.a))
+    return _copy_exp_with_operator(operator, conj(operator.O), conj(operator.a))
 end
 
 function Base.adjoint(operator::ExpOp)
-    return _copy_exp_with_operator(operator, adjoint(_operator_dense(operator.O)), conj(operator.a))
+    return _copy_exp_with_operator(operator, adjoint(operator.O), conj(operator.a))
 end
 
 function _copy_exp_with_operator(source::ExpOp, O, a)
@@ -2250,36 +3318,102 @@ end
 
 function _exp_matrix(operator::ExpOp, scale::Number=1; shift=nothing)
     matrix = _operator_dense(operator.O)
-    shifted = shift === nothing ?
-        matrix :
-        matrix + shift * Matrix{promote_type(eltype(matrix), typeof(shift))}(
-            I,
-            size(matrix)...,
-        )
-    return exp((operator.a * scale) * shifted)
+    result = exp((operator.a * scale) * matrix)
+    shift === nothing ||
+        lmul!(exp(operator.a * scale * shift), result)
+    return result
 end
 
-get_mat(operator::ExpOp; dense::Bool=true, kwargs...) = _exp_matrix(operator)
+get_mat(operator::ExpOp; dense::Bool=true, shift=nothing, kwargs...) =
+    dense ?
+    _exp_matrix(operator; shift) :
+    sparse(_exp_matrix(operator; shift))
 
-function _grid_results(operator::ExpOp, operation; shift=nothing)
+_exp_source(operator::AbstractMatrix; kwargs...) = operator
+_exp_source(operator::Hamiltonian; time=0, kwargs...) =
+    aslinearoperator(operator; time)
+_exp_source(operator::QuantumOperator; pars::AbstractDict=Dict(), kwargs...) =
+    aslinearoperator(operator; pars)
+
+function _exp_apply_single(
+    operator::ExpOp,
+    value::AbstractVecOrMat,
+    scale::Number;
+    shift=nothing,
+    kwargs...,
+)
+    source = _exp_source(operator.O; kwargs...)
+    result = _krylov_expmv(
+        source,
+        value,
+        operator.a * scale;
+        tol=get(kwargs, :tol, 1e-12),
+        krylov_dim=get(kwargs, :krylov_dim, 30),
+    )
+    shift === nothing ||
+        lmul!(exp(operator.a * scale * shift), result)
+    return result
+end
+
+function _exp_grid_action(operator::ExpOp, value; shift=nothing, kwargs...)
     if operator.grid === nothing
-        return operation(_exp_matrix(operator; shift))
+        return _exp_apply_single(operator, value, 1; shift, kwargs...)
     end
-    results = [
-        operation(_exp_matrix(operator, scale; shift))
+    operator.iterate && return (
+        _exp_apply_single(operator, value, scale; shift, kwargs...)
         for scale in operator.grid
-    ]
-    operator.iterate && return (result for result in results)
-    first(results) isa AbstractVector && return reduce(hcat, results)
-    return cat(results...; dims=3)
+    )
+    if value isa AbstractVector
+        source = _exp_source(operator.O; kwargs...)
+        scales = operator.a .* operator.grid
+        results = _krylov_expmv_times(
+            source,
+            value,
+            scales;
+            tol=get(kwargs, :tol, 1e-12),
+            krylov_dim=get(kwargs, :krylov_dim, 30),
+        )
+        if shift !== nothing
+            for (column, scale) in pairs(operator.grid)
+                rmul!(
+                    @view(results[:, column]),
+                    exp(operator.a * scale * shift),
+                )
+            end
+        end
+        return results
+    end
+    source = _exp_source(operator.O; kwargs...)
+    T = promote_type(
+        eltype(source),
+        eltype(value),
+        typeof(operator.a),
+        shift === nothing ? Float64 : typeof(shift),
+    )
+    results = Array{T}(
+        undef,
+        size(value, 1),
+        size(value, 2),
+        length(operator.grid),
+    )
+    for (index, scale) in pairs(operator.grid)
+        state = _exp_apply_single(
+            operator,
+            value,
+            scale;
+            shift,
+            kwargs...,
+        )
+        copyto!(@view(results[:, :, index]), state)
+    end
+    return results
 end
 
 function apply(operator::ExpOp, other; shift=nothing, kwargs...)
-    return _grid_results(
-        operator,
-        matrix -> matrix * _operator_dense_or_self(other);
-        shift,
-    )
+    value = _operator_dense_or_self(other)
+    value isa AbstractVecOrMat ||
+        throw(ArgumentError("exponential action requires a vector or matrix"))
+    return _exp_grid_action(operator, value; shift, kwargs...)
 end
 
 _operator_dense_or_self(value::Hamiltonian) = Matrix(value)
@@ -2287,20 +3421,60 @@ _operator_dense_or_self(value) = value
 
 function right_apply(operator::ExpOp, other; shift=nothing, kwargs...)
     value = _operator_dense_or_self(other)
-    return _grid_results(
-        operator,
-        matrix -> value isa AbstractVector ?
-            vec(transpose(value) * matrix) :
-            value * matrix;
-        shift,
-    )
+    transposed_operator = transpose(operator)
+    return value isa AbstractVector ?
+        apply(transposed_operator, value; shift, kwargs...) :
+        begin
+            result = apply(
+                transposed_operator,
+                transpose(value);
+                shift,
+                kwargs...,
+            )
+            result isa AbstractArray && ndims(result) == 3 ?
+                permutedims(result, (2, 1, 3)) :
+                result isa AbstractMatrix ? transpose(result) :
+                (transpose(state) for state in result)
+        end
 end
 
 function sandwich(operator::ExpOp, other; shift=nothing, kwargs...)
     value = _operator_dense_or_self(other)
     value isa AbstractMatrix && size(value, 1) == size(value, 2) ||
         throw(ArgumentError("sandwiched value must be a square matrix"))
-    return _grid_results(operator, matrix -> matrix * value * matrix'; shift)
+    left = apply(operator, value; shift, kwargs...)
+    if operator.grid === nothing
+        return right_apply(
+            adjoint(operator),
+            left;
+            shift=shift === nothing ? nothing : conj(shift),
+            kwargs...,
+        )
+    end
+    if operator.iterate
+        return (
+            right_apply(
+                ExpOp(adjoint(operator.O); a=conj(operator.a) * scale),
+                left_state;
+                shift=shift === nothing ? nothing : conj(shift),
+                kwargs...,
+            )
+            for (left_state, scale) in zip(left, operator.grid)
+        )
+    end
+    states = [
+        begin
+            single = ExpOp(adjoint(operator.O); a=conj(operator.a) * scale)
+            right_apply(
+                single,
+                @view(left[:, :, index]);
+                shift=shift === nothing ? nothing : conj(shift),
+                kwargs...,
+            )
+        end
+        for (index, scale) in pairs(operator.grid)
+    ]
+    return cat(states...; dims=3)
 end
 
 Base.:*(operator::ExpOp, other) = apply(operator, other)
