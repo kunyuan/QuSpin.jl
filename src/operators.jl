@@ -2559,18 +2559,11 @@ function right_apply(
             input = result !== nothing && Base.mightalias(result, value) ?
                 copy(value) :
                 value
-            unit = zeros(T, size(operator, 1))
-            matrix = Matrix{T}(undef, size(operator)...)
-            @inbounds for index in axes(matrix, 2)
-                unit[index] = one(T)
-                mul!(@view(matrix[:, index]), operator, unit)
-                unit[index] = zero(T)
-            end
             # Match the platform BLAS reduction order used by
             # transpose(value) * Matrix(operator).  This exact-compatibility
             # crossover is deliberately restricted to tiny operators; the
             # general path below remains matrix-free.
-            product = vec(transpose(input) * matrix)
+            product = vec(transpose(input) * Matrix(operator))
             isone(a) || lmul!(a, product)
             result === nothing && return product
             copyto!(result, product)
