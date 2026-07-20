@@ -2552,24 +2552,28 @@ function right_apply(
        size(operator, 1) <= 64
         T = promote_type(eltype(operator), eltype(value), typeof(a))
         if T <: LinearAlgebra.BlasFloat
-            result = out === nothing ? zeros(T, size(operator, 2)) : out
-            length(result) == size(operator, 2) ||
+            result = out === nothing ? nothing : out
+            result === nothing ||
+                length(result) == size(operator, 2) ||
                 throw(DimensionMismatch("out must have length Ns"))
-            input = Base.mightalias(result, value) ? copy(value) : value
+            input = result !== nothing && Base.mightalias(result, value) ?
+                copy(value) :
+                value
             unit = zeros(T, size(operator, 1))
-            column = similar(unit)
-            @inbounds for index in eachindex(result)
+            matrix = Matrix{T}(undef, size(operator)...)
+            @inbounds for index in axes(matrix, 2)
                 unit[index] = one(T)
-                mul!(column, operator, unit)
-                result[index] = a * LinearAlgebra.BLAS.dotu(
-                    length(input),
-                    input,
-                    stride(input, 1),
-                    column,
-                    1,
-                )
+                mul!(@view(matrix[:, index]), operator, unit)
                 unit[index] = zero(T)
             end
+            # Match the platform BLAS reduction order used by
+            # transpose(value) * Matrix(operator).  This exact-compatibility
+            # crossover is deliberately restricted to tiny operators; the
+            # general path below remains matrix-free.
+            product = vec(transpose(input) * matrix)
+            isone(a) || lmul!(a, product)
+            result === nothing && return product
+            copyto!(result, product)
             return result
         end
     end
