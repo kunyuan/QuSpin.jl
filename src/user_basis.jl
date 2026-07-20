@@ -4,13 +4,66 @@
 User-defined finite basis. Local operators may be supplied as `sps × sps`
 matrices or deterministic callbacks `(encoded_state, site) -> (state, factor)`.
 """
-struct UserBasis <: AbstractBasis
+struct UserBasis{T<:Integer,A<:Tuple,N} <: AbstractBasis
     base::DiscreteBasis{:user}
-    basis_dtype::DataType
+    basis_dtype::Type{T}
     op_dict::Dict{Any,Any}
-    allowed_ops::Tuple
+    allowed_ops::A
     user_blocks::Dict{Symbol,Any}
-    user_noncommuting_bits::Any
+    user_noncommuting_bits::N
+end
+
+_user_dict_get(dictionary::AbstractDict, key::Symbol, default=nothing) =
+    haskey(dictionary, key) ?
+    dictionary[key] :
+    get(dictionary, String(key), default)
+
+function _next_user_pcon_state(next_state, state, counter, N, arguments)
+    if applicable(next_state, state, counter, N, arguments)
+        return UInt64(next_state(state, counter, N, arguments))
+    elseif applicable(next_state, state, counter, N)
+        return UInt64(next_state(state, counter, N))
+    elseif applicable(next_state, state, counter)
+        return UInt64(next_state(state, counter))
+    end
+    throw(ArgumentError(
+        "pcon_dict next_state must accept (state,counter,N,args), " *
+        "(state,counter,N), or (state,counter)",
+    ))
+end
+
+function _user_pcon_states(pcon_dict::AbstractDict, N::Int, predicate)
+    next_state = _user_dict_get(pcon_dict, :next_state)
+    get_dimension = _user_dict_get(pcon_dict, :get_Ns_pcon)
+    get_initial = _user_dict_get(pcon_dict, :get_s0_pcon)
+    sectors = _user_dict_get(pcon_dict, :Np)
+    any(value -> value === nothing, (next_state, get_dimension, get_initial, sectors)) &&
+        return nothing
+    arguments = _user_dict_get(pcon_dict, :next_state_args, ())
+    selected_sectors = sectors isa Union{Integer,Tuple} ?
+        (sectors,) :
+        Tuple(sectors)
+    encoded = UInt64[]
+    for sector in selected_sectors
+        count = Int(get_dimension(N, sector))
+        count >= 0 ||
+            throw(ArgumentError("get_Ns_pcon must return a nonnegative size"))
+        iszero(count) && continue
+        state = UInt64(get_initial(N, sector))
+        for counter in 0:(count - 1)
+            predicate(state) && push!(encoded, state)
+            counter == count - 1 && break
+            state = _next_user_pcon_state(
+                next_state,
+                state,
+                counter,
+                N,
+                arguments,
+            )
+        end
+    end
+    sort!(unique!(encoded))
+    return encoded
 end
 
 function UserBasis(
@@ -31,44 +84,72 @@ function UserBasis(
     blocks...,
 )
     basis_dtype <: Integer || throw(ArgumentError("basis_dtype must be an integer type"))
-    explicit_states = states
-    if explicit_states === nothing && pcon_dict isa AbstractDict
-        explicit_states = get(pcon_dict, :states, get(pcon_dict, "states", nothing))
-    end
-    state_set = explicit_states === nothing ?
-        nothing :
-        Set(UInt64.(collect(explicit_states)))
     predicate = if pre_check_state === nothing
         state -> true
+    elseif applicable(pre_check_state, zero(UInt64), N)
+        state -> Bool(pre_check_state(state, N))
+    elseif applicable(pre_check_state, zero(UInt64))
+        state -> Bool(pre_check_state(state))
     else
-        state -> try
-            Bool(pre_check_state(state, N))
-        catch error
-            error isa MethodError || rethrow()
-            Bool(pre_check_state(state))
-        end
-    end
-    keep = occupations -> begin
-        encoded = UInt64(sum(
-            occupations[site] * sps^(site - 1)
-            for site in 1:N
+        throw(ArgumentError(
+            "pre_check_state must accept (state) or (state, N)",
         ))
-        (state_set === nothing || encoded in state_set) && predicate(encoded)
     end
-    base = _make_discrete_basis(
-        Val(:user),
-        N,
-        sps,
-        pcon_dict,
-        keep,
-        "user-defined finite basis",
-        allowed_ops === nothing ? Tuple(keys(op_dict)) : Tuple(allowed_ops),
-    )
+    explicit_states = states
+    if explicit_states === nothing && pcon_dict isa AbstractDict
+        explicit_states = _user_dict_get(pcon_dict, :states)
+        explicit_states === nothing &&
+            (explicit_states = _user_pcon_states(
+                pcon_dict,
+                Int(N),
+                predicate,
+            ))
+    end
+    operators =
+        allowed_ops === nothing ?
+        Tuple(keys(op_dict)) :
+        Tuple(allowed_ops)
+    base = if explicit_states === nothing
+        keep = occupations -> begin
+            encoded = UInt64(sum(
+                occupations[site] * sps^(site - 1)
+                for site in 1:N
+            ))
+            predicate(encoded)
+        end
+        _make_discrete_basis(
+            Val(:user),
+            N,
+            sps,
+            pcon_dict,
+            keep,
+            "user-defined finite basis",
+            operators,
+        )
+    else
+        dimension = BigInt(sps)^N
+        dimension <= typemax(UInt64) ||
+            throw(ArgumentError("basis encoding exceeds UInt64"))
+        encoded = sort!(unique(UInt64.(collect(explicit_states))))
+        filter!(
+            state -> state < UInt64(dimension) && predicate(state),
+            encoded,
+        )
+        _discrete_basis_from_encoded(
+            Val(:user),
+            N,
+            sps,
+            pcon_dict,
+            encoded,
+            "user-defined finite basis",
+            operators,
+        )
+    end
     return UserBasis(
         base,
         basis_dtype,
         Dict{Any,Any}(op_dict),
-        allowed_ops === nothing ? Tuple(keys(op_dict)) : Tuple(allowed_ops),
+        operators,
         Dict{Symbol,Any}(Symbol(key) => value for (key, value) in blocks),
         noncommuting_bits,
     )
@@ -91,9 +172,16 @@ function Base.getproperty(basis::UserBasis, name::Symbol)
     return getfield(basis, name)
 end
 
-states(basis::UserBasis) = copy(basis.states)
-projection_matrix(basis::UserBasis, ::Type{T}=Float64) where {T<:Number} =
-    projection_matrix(basis.base, T)
+states(basis::UserBasis) =
+    basis.basis_dtype.(basis.base.encoded_states)
+projection_matrix(
+    basis::UserBasis,
+    ::Type{T}=Float64;
+    sparse::Bool=false,
+) where {T<:Number} =
+    projection_matrix(basis.base, T; sparse)
+_full_projection_dimension(basis::UserBasis) =
+    _full_projection_dimension(basis.base)
 project_from(basis::UserBasis, vector::AbstractVecOrMat; kwargs...) =
     project_from(basis.base, vector; kwargs...)
 get_vec(basis::UserBasis, vector::AbstractVecOrMat; kwargs...) =
@@ -118,63 +206,161 @@ function _user_operator(basis::UserBasis, op)
     throw(ArgumentError("operator '$op' is not defined"))
 end
 
-function operator_matrix(
+function _apply_user_definition!(
+    next_branches::Dict{UInt64,ComplexF64},
+    definition::AbstractMatrix,
+    encoded::UInt64,
+    amplitude,
+    site::Int,
+    sps::Int,
+    weight::UInt64,
+)
+    size(definition) == (sps, sps) ||
+        throw(DimensionMismatch("local operator must have shape (sps,sps)"))
+    old = Int((encoded ÷ weight) % UInt64(sps))
+    for new in 0:(sps - 1)
+        factor = definition[new + 1, old + 1]
+        iszero(factor) && continue
+        updated = UInt64(
+            Int128(encoded) + Int128(new - old) * Int128(weight),
+        )
+        next_branches[updated] =
+            get(next_branches, updated, 0) + amplitude * factor
+    end
+    return next_branches
+end
+
+function _apply_user_definition!(
+    next_branches::Dict{UInt64,ComplexF64},
+    definition::Function,
+    encoded::UInt64,
+    amplitude,
+    site::Int,
+    sps::Int,
+    weight::UInt64,
+)
+    updated, factor = definition(encoded, site)
+    converted = UInt64(updated)
+    next_branches[converted] =
+        get(next_branches, converted, 0) + amplitude * factor
+    return next_branches
+end
+
+function _apply_user_definition!(
+    next_branches::Dict{UInt64,ComplexF64},
+    definition,
+    encoded::UInt64,
+    amplitude,
+    site::Int,
+    sps::Int,
+    weight::UInt64,
+)
+    throw(ArgumentError("operators must be matrices or callbacks"))
+end
+
+function _user_callback_entry(
+    definition::Function,
+    encoded::UInt64,
+    site::Int,
+)
+    updated, factor = definition(encoded, site)
+    return UInt64(updated), complex(factor)
+end
+
+function _user_operator_triplets(
     basis::UserBasis,
     opstring::AbstractString,
     couplings,
 )
-    matrix = zeros(ComplexF64, length(basis), length(basis))
+    rows = Int[]
+    columns = Int[]
+    values = ComplexF64[]
+    weights = UInt64[
+        UInt64(basis.sps)^(site - 1) for site in 1:basis.N
+    ]
     for coupling in couplings
         length(coupling) == length(opstring) + 1 ||
             throw(ArgumentError("operator arity and sites differ"))
-        for (column, initial) in pairs(basis.base.encoded_states)
-            branches = Dict(initial => complex(first(coupling)))
+        actions = [
+            (_user_operator(basis, op), Int(site))
             for (op, site) in Iterators.reverse(
                 collect(zip(opstring, coupling[2:end])),
             )
-                1 <= site <= basis.N ||
-                    throw(ArgumentError("site must lie in 1:$(basis.N)"))
-                definition = _user_operator(basis, op)
+        ]
+        for (_, site) in actions
+            1 <= site <= basis.N ||
+                throw(ArgumentError("site must lie in 1:$(basis.N)"))
+        end
+        deterministic = all(action -> action[1] isa Function, actions)
+        for (column, initial) in pairs(basis.base.encoded_states)
+            if deterministic
+                encoded = initial
+                amplitude = complex(first(coupling))
+                for (definition, site) in actions
+                    encoded, factor =
+                        _user_callback_entry(definition, encoded, site)
+                    amplitude *= factor
+                end
+                row = get(basis.base.lookup, encoded, 0)
+                row == 0 && continue
+                push!(rows, row)
+                push!(columns, column)
+                push!(values, amplitude)
+                continue
+            end
+            branches = Dict(initial => complex(first(coupling)))
+            for (definition, site) in actions
                 next_branches = Dict{UInt64,ComplexF64}()
                 for (encoded, amplitude) in branches
-                    if definition isa AbstractMatrix
-                        size(definition) == (basis.sps, basis.sps) ||
-                            throw(DimensionMismatch("local operator must have shape (sps,sps)"))
-                        occupations = _digits(encoded, basis.N, basis.sps)
-                        old = occupations[site]
-                        for new in 0:(basis.sps - 1)
-                            factor = definition[new + 1, old + 1]
-                            iszero(factor) && continue
-                            updated = UInt64(
-                                Int(encoded) +
-                                (new - old) * basis.sps^(site - 1),
-                            )
-                            next_branches[updated] =
-                                get(next_branches, updated, 0) + amplitude * factor
-                        end
-                    elseif definition isa Function
-                        updated, factor = definition(encoded, site)
-                        next_branches[UInt64(updated)] =
-                            get(next_branches, UInt64(updated), 0) + amplitude * factor
-                    else
-                        throw(ArgumentError("operators must be matrices or callbacks"))
-                    end
+                    _apply_user_definition!(
+                        next_branches,
+                        definition,
+                        encoded,
+                        amplitude,
+                        site,
+                        basis.sps,
+                        weights[site],
+                    )
                 end
                 branches = next_branches
             end
             for (encoded, amplitude) in branches
                 row = get(basis.base.lookup, encoded, 0)
-                row == 0 || (matrix[row, column] += amplitude)
+                row == 0 && continue
+                push!(rows, row)
+                push!(columns, column)
+                push!(values, amplitude)
             end
         end
     end
-    return matrix
+    return rows, columns, values
+end
+
+function operator_matrix(
+    basis::UserBasis,
+    opstring::AbstractString,
+    couplings,
+    ;
+    sparse::Bool=false,
+)
+    rows, columns, values =
+        _user_operator_triplets(basis, opstring, couplings)
+    matrix = SparseArrays.sparse(
+        rows,
+        columns,
+        values,
+        length(basis),
+        length(basis),
+    )
+    return sparse ? matrix : Matrix(matrix)
 end
 
 function inplace_op!(out, basis::UserBasis, opstring, couplings)
     size(out) == (length(basis), length(basis)) ||
         throw(DimensionMismatch("out must have shape (Ns,Ns)"))
-    out .+= operator_matrix(basis, opstring, couplings)
+    rows, columns, values =
+        _user_operator_triplets(basis, opstring, couplings)
+    _accumulate_triplets!(out, rows, columns, values)
     return out
 end
 
