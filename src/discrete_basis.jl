@@ -1831,67 +1831,256 @@ function _operator_actions(
     return [(op, Int(site), :single) for (op, site) in zip(opstring, sites)]
 end
 
+function _discrete_operator_expansions(
+    basis::DiscreteBasis{K},
+    opstring::AbstractString,
+) where {K}
+    if K in (:spinless_fermion, :spinful_fermion, :spin) &&
+       any(operator -> operator in ('x', 'y'), opstring)
+        expansions = Tuple{String,ComplexF64}[("", 1.0 + 0im)]
+        transverse_scale = K === :spin ? 0.5 : 1.0
+        for operator in opstring
+            choices = if operator == 'x'
+                (
+                    ('+', ComplexF64(transverse_scale)),
+                    ('-', ComplexF64(transverse_scale)),
+                )
+            elseif operator == 'y'
+                K === :spin ?
+                (
+                    ('+', -im * transverse_scale),
+                    ('-', im * transverse_scale),
+                ) :
+                (
+                    ('+', im * transverse_scale),
+                    ('-', -im * transverse_scale),
+                )
+            else
+                ((operator, 1.0 + 0im),)
+            end
+            expansions = [
+                (prefix * string(expanded), coefficient * scale)
+                for (prefix, coefficient) in expansions
+                for (expanded, scale) in choices
+            ]
+        end
+        return expansions
+    end
+    return Tuple{String,ComplexF64}[(String(opstring), 1.0 + 0im)]
+end
+
+abstract type _AbstractDiscreteStateIndexer end
+
+struct _HashDiscreteStateIndexer{D<:AbstractDict} <:
+       _AbstractDiscreteStateIndexer
+    lookup::D
+end
+
+struct _CombinadicDiscreteStateIndexer <:
+       _AbstractDiscreteStateIndexer
+    particles::Int
+    dimension::Int
+    binomials::Matrix{Int}
+end
+
+@inline _discrete_state_index(
+    indexer::_HashDiscreteStateIndexer,
+    encoded::UInt64,
+) = get(indexer.lookup, encoded, 0)
+
+@inline function _discrete_state_index(
+    indexer::_CombinadicDiscreteStateIndexer,
+    encoded::UInt64,
+)
+    count_ones(encoded) == indexer.particles || return 0
+    rank = 0
+    particle = 1
+    remaining = encoded
+    @inbounds while !iszero(remaining)
+        bit = trailing_zeros(remaining)
+        rank += indexer.binomials[bit + 1, particle + 1]
+        particle += 1
+        remaining &= remaining - UInt64(1)
+    end
+    row = rank + 1
+    return row <= indexer.dimension ? row : 0
+end
+
+function _discrete_state_indexer(basis::DiscreteBasis)
+    particles = basis.conservation
+    if !_has_symmetry(basis.symmetry) &&
+       basis.sps == 2 &&
+       particles isa Integer &&
+       0 <= particles <= basis.L &&
+       binomial(basis.L, Int(particles)) == length(basis)
+        count = Int(particles)
+        binomials = zeros(Int, basis.L, count + 1)
+        @inbounds for bit in 0:(basis.L - 1), particle in 1:count
+            binomials[bit + 1, particle + 1] = binomial(bit, particle)
+        end
+        return _CombinadicDiscreteStateIndexer(
+            count,
+            length(basis),
+            binomials,
+        )
+    end
+    return _HashDiscreteStateIndexer(basis.lookup)
+end
+
+# This is the narrow waist between model notation and sparse storage: basis
+# families compile their notation to transitions, while assemblers consume
+# only coefficients and local actions.
+struct _CompiledDiscreteTransition{T<:Number}
+    coefficient::T
+    actions::Vector{Tuple{Char,Int,Symbol}}
+end
+
+function _convert_discrete_coefficient(::Type{T}, coefficient) where {T}
+    if T <: Real && coefficient isa Complex
+        iszero(imag(coefficient)) ||
+            throw(InexactError(:_discrete_operator_csc, T, coefficient))
+        return convert(T, real(coefficient))
+    end
+    return convert(T, coefficient)
+end
+
+function _compile_discrete_transitions(
+    basis::DiscreteBasis,
+    specifications,
+    ::Type{T},
+) where {T<:Number}
+    transitions = _CompiledDiscreteTransition{T}[]
+    for (opstring, couplings) in specifications
+        for (expanded, scale) in
+            _discrete_operator_expansions(basis, opstring)
+            for coupling in couplings
+                coefficient = _convert_discrete_coefficient(
+                    T,
+                    scale * first(coupling),
+                )
+                iszero(coefficient) && continue
+                actions = _operator_actions(
+                    basis,
+                    expanded,
+                    Base.tail(coupling),
+                )
+                push!(
+                    transitions,
+                    _CompiledDiscreteTransition{T}(coefficient, actions),
+                )
+            end
+        end
+    end
+    return transitions
+end
+
+function _assemble_discrete_csc(
+    basis::DiscreteBasis,
+    transitions::Vector{_CompiledDiscreteTransition{T}},
+    indexer::_AbstractDiscreteStateIndexer,
+) where {T<:Number}
+    dimension = length(basis)
+    column_pointers = Vector{Int}(undef, dimension + 1)
+    column_pointers[1] = 1
+    row_values = Int[]
+    nonzeros = T[]
+    touched = Int[]
+    sizehint!(touched, length(transitions))
+    markers = zeros(Int, dimension)
+    accumulated = zeros(T, dimension)
+    weights = UInt64[
+        UInt64(basis.sps)^(site - 1) for site in 1:basis.L
+    ]
+
+    @inbounds for column in eachindex(basis.encoded_states)
+        empty!(touched)
+        initial = basis.encoded_states[column]
+        for transition in transitions
+            encoded = initial
+            amplitude = transition.coefficient
+            alive = true
+            for (op, site, species) in Iterators.reverse(transition.actions)
+                encoded, factor, alive = _apply_discrete_encoded_local(
+                    basis,
+                    encoded,
+                    op,
+                    site,
+                    species,
+                    weights[site],
+                    weights,
+                )
+                alive || break
+                amplitude *= _convert_discrete_coefficient(T, factor)
+            end
+            alive || continue
+            row = _discrete_state_index(indexer, encoded)
+            iszero(row) && continue
+            if markers[row] == column
+                accumulated[row] += amplitude
+            else
+                markers[row] = column
+                accumulated[row] = amplitude
+                push!(touched, row)
+            end
+        end
+        sort!(touched)
+        for row in touched
+            value = accumulated[row]
+            iszero(value) && continue
+            push!(row_values, row)
+            push!(nonzeros, value)
+        end
+        column_pointers[column + 1] = length(row_values) + 1
+    end
+    return SparseMatrixCSC{T,Int}(
+        dimension,
+        dimension,
+        column_pointers,
+        row_values,
+        nonzeros,
+    )
+end
+
+function _discrete_operator_csc(
+    basis::DiscreteBasis,
+    specifications,
+    ::Type{T},
+) where {T<:Number}
+    _has_symmetry(basis.symmetry) &&
+        throw(ArgumentError(
+            "direct CSC assembly requires an unreduced discrete basis",
+        ))
+    transitions = _compile_discrete_transitions(
+        basis,
+        specifications,
+        T,
+    )
+    return _assemble_discrete_csc(
+        basis,
+        transitions,
+        _discrete_state_indexer(basis),
+    )
+end
+
+function _discrete_operator_type(opstring::AbstractString, couplings)
+    coefficient_type = isempty(couplings) ?
+        Float64 :
+        promote_type(
+            Float64,
+            (typeof(first(coupling)) for coupling in couplings)...,
+        )
+    return any(operator -> operator in ('x', 'y'), opstring) ?
+        promote_type(ComplexF64, coefficient_type) :
+        coefficient_type
+end
+
 function _discrete_operator_triplets(
     basis::DiscreteBasis,
     opstring::AbstractString,
     couplings,
 )
-    if basis isa Union{
-        DiscreteBasis{:spinless_fermion},
-        DiscreteBasis{:spinful_fermion},
-    } && any(operator -> operator in ('x', 'y'), opstring)
-        expansions = Tuple{String,ComplexF64}[("", 1.0 + 0im)]
-        for operator in opstring
-            choices = if operator == 'x'
-                (('+', 1.0 + 0im), ('-', 1.0 + 0im))
-            elseif operator == 'y'
-                (('+', 1.0im), ('-', -1.0im))
-            else
-                ((operator, 1.0 + 0im),)
-            end
-            expansions = [
-                (prefix * string(expanded), coefficient * scale)
-                for (prefix, coefficient) in expansions
-                for (expanded, scale) in choices
-            ]
-        end
-        rows = Int[]
-        columns = Int[]
-        values = ComplexF64[]
-        for (expanded, scale) in expansions
-            scaled_couplings = [
-                (scale * first(coupling), Base.tail(coupling)...)
-                for coupling in couplings
-            ]
-            expanded_rows, expanded_columns, expanded_values =
-                _discrete_operator_triplets(
-                    basis,
-                    expanded,
-                    scaled_couplings,
-                )
-            append!(rows, expanded_rows)
-            append!(columns, expanded_columns)
-            append!(values, expanded_values)
-        end
-        return rows, columns, values
-    end
-    if basis isa DiscreteBasis{:spin} &&
-       any(operator -> operator in ('x', 'y'), opstring)
-        expansions = Tuple{String,ComplexF64}[("", 1.0 + 0im)]
-        for operator in opstring
-            choices = if operator == 'x'
-                (('+', 0.5 + 0im), ('-', 0.5 + 0im))
-            elseif operator == 'y'
-                (('+', -0.5im), ('-', 0.5im))
-            else
-                ((operator, 1.0 + 0im),)
-            end
-            expansions = [
-                (prefix * string(expanded), coefficient * scale)
-                for (prefix, coefficient) in expansions
-                for (expanded, scale) in choices
-            ]
-        end
+    expansions = _discrete_operator_expansions(basis, opstring)
+    if length(expansions) > 1 || first(expansions)[1] != opstring
         rows = Int[]
         columns = Int[]
         values = ComplexF64[]
@@ -1995,14 +2184,11 @@ function operator_matrix(
         )
         return sparse ? projected : Matrix(projected)
     end
-    rows, columns, values =
-        _discrete_operator_triplets(basis, opstring, couplings)
-    matrix = SparseArrays.sparse(
-        rows,
-        columns,
-        values,
-        length(basis),
-        length(basis),
+    coefficient_type = _discrete_operator_type(opstring, couplings)
+    matrix = _discrete_operator_csc(
+        basis,
+        ((opstring, couplings),),
+        coefficient_type,
     )
     return sparse ? matrix : Matrix(matrix)
 end
