@@ -453,6 +453,400 @@ function _user_operator(basis::UserBasis, op)
     throw(ArgumentError("operator '$op' is not defined"))
 end
 
+# Compile dynamic user definitions once, then keep state-by-state assembly in
+# concrete matrix/callback action types. The final assembler writes CSC columns
+# directly and reuses its branch and accumulation buffers across all states.
+struct _CompiledUserMatrixAction{T<:Number}
+    weight::UInt64
+    offsets::Vector{Int}
+    deltas::Vector{Int128}
+    factors::Vector{T}
+    branching::Bool
+end
+
+struct _CompiledUserCallbackAction{F}
+    site::Int
+    definition::F
+end
+
+struct _CompiledUserTransition{T<:Number,A<:Tuple}
+    coefficient::T
+    actions::A
+end
+
+struct _CompiledUserTerm{T<:Number,A<:Tuple}
+    transitions::Vector{_CompiledUserTransition{T,A}}
+end
+
+function _convert_user_coefficient(::Type{T}, coefficient) where {T<:Number}
+    if T <: Real && coefficient isa Complex
+        iszero(imag(coefficient)) ||
+            throw(InexactError(:_user_operator_csc, T, coefficient))
+        return convert(T, real(coefficient))
+    end
+    return convert(T, coefficient)
+end
+
+function _compile_user_action(
+    definition::AbstractMatrix,
+    site::Int,
+    basis::UserBasis,
+    ::Type{T},
+) where {T<:Number}
+    size(definition) == (basis.sps, basis.sps) ||
+        throw(DimensionMismatch("local operator must have shape (sps,sps)"))
+    weight = UInt64(basis.sps)^(site - 1)
+    offsets = Vector{Int}(undef, basis.sps + 1)
+    deltas = Int128[]
+    factors = T[]
+    offsets[1] = 1
+    for old in 0:(basis.sps - 1)
+        for new in 0:(basis.sps - 1)
+            factor = definition[new + 1, old + 1]
+            iszero(factor) && continue
+            push!(
+                deltas,
+                Int128(new - old) * Int128(weight),
+            )
+            push!(factors, _convert_user_coefficient(T, factor))
+        end
+        offsets[old + 2] = length(factors) + 1
+    end
+    return _CompiledUserMatrixAction{T}(
+        weight,
+        offsets,
+        deltas,
+        factors,
+        any(
+            offsets[index + 1] - offsets[index] > 1
+            for index in 1:basis.sps
+        ),
+    )
+end
+
+_compile_user_action(
+    definition::Function,
+    site::Int,
+    ::UserBasis,
+    ::Type{T},
+) where {T<:Number} = _CompiledUserCallbackAction(site, definition)
+
+function _compile_user_action(
+    definition,
+    ::Int,
+    ::UserBasis,
+    ::Type{T},
+) where {T<:Number}
+    throw(ArgumentError("operators must be matrices or callbacks"))
+end
+
+_compile_user_actions(
+    ::UserBasis,
+    ::Tuple{},
+    ::Tuple{},
+    ::Type{T},
+) where {T<:Number} = ()
+
+function _compile_user_actions(
+    basis::UserBasis,
+    operators::Tuple,
+    sites::Tuple,
+    ::Type{T},
+) where {T<:Number}
+    length(operators) == length(sites) ||
+        throw(ArgumentError("operator arity and sites differ"))
+    site = Int(first(sites))
+    1 <= site <= basis.N ||
+        throw(ArgumentError("site must lie in 1:$(basis.N)"))
+    definition = _user_operator(basis, first(operators))
+    action = _compile_user_action(definition, site, basis, T)
+    remaining = _compile_user_actions(
+        basis,
+        Base.tail(operators),
+        Base.tail(sites),
+        T,
+    )
+    return (action, remaining...)
+end
+
+function _compile_user_transition(
+    basis::UserBasis,
+    opstring::AbstractString,
+    coupling,
+    ::Type{T},
+) where {T<:Number}
+    length(coupling) == length(opstring) + 1 ||
+        throw(ArgumentError("operator arity and sites differ"))
+    operators = reverse(Tuple(opstring))
+    sites = reverse(Tuple(coupling[2:end]))
+    actions = _compile_user_actions(basis, operators, sites, T)
+    coefficient = _convert_user_coefficient(T, first(coupling))
+    return _CompiledUserTransition{T,typeof(actions)}(
+        coefficient,
+        actions,
+    )
+end
+
+function _append_user_transition(::Nothing, transition)
+    transitions = Vector{typeof(transition)}()
+    push!(transitions, transition)
+    return transitions
+end
+
+function _append_user_transition(
+    transitions::Vector{T},
+    transition::T,
+) where {T}
+    push!(transitions, transition)
+    return transitions
+end
+
+function _compile_user_term(
+    basis::UserBasis,
+    opstring::AbstractString,
+    couplings,
+    ::Type{T},
+) where {T<:Number}
+    transitions = nothing
+    for coupling in couplings
+        transition = _compile_user_transition(
+            basis,
+            opstring,
+            coupling,
+            T,
+        )
+        iszero(transition.coefficient) && continue
+        transitions = _append_user_transition(transitions, transition)
+    end
+    transitions === nothing && return nothing
+    return _CompiledUserTerm(transitions)
+end
+
+@inline function _apply_compiled_user_action!(
+    output_states::Vector{UInt64},
+    output_values::Vector{T},
+    output_lookup::Dict{UInt64,Int},
+    action::_CompiledUserMatrixAction{T},
+    input_states::Vector{UInt64},
+    input_values::Vector{T},
+) where {T<:Number}
+    action.branching && empty!(output_lookup)
+    @inbounds for branch in eachindex(input_states)
+        encoded = input_states[branch]
+        old = Int((encoded ÷ action.weight) % UInt64(length(action.offsets) - 1))
+        for pointer in action.offsets[old + 1]:(action.offsets[old + 2] - 1)
+            amplitude = input_values[branch] * action.factors[pointer]
+            iszero(amplitude) && continue
+            updated = UInt64(
+                Int128(encoded) + action.deltas[pointer],
+            )
+            if action.branching
+                index = get(output_lookup, updated, 0)
+                if iszero(index)
+                    push!(output_states, updated)
+                    push!(output_values, amplitude)
+                    output_lookup[updated] = length(output_states)
+                else
+                    output_values[index] += amplitude
+                end
+            else
+                push!(output_states, updated)
+                push!(output_values, amplitude)
+            end
+        end
+    end
+    return nothing
+end
+
+@inline function _apply_compiled_user_action!(
+    output_states::Vector{UInt64},
+    output_values::Vector{T},
+    ::Dict{UInt64,Int},
+    action::_CompiledUserCallbackAction,
+    input_states::Vector{UInt64},
+    input_values::Vector{T},
+) where {T<:Number}
+    @inbounds for branch in eachindex(input_states)
+        updated, factor = action.definition(
+            input_states[branch],
+            action.site,
+        )
+        amplitude = input_values[branch] *
+            _convert_user_coefficient(T, factor)
+        iszero(amplitude) && continue
+        push!(output_states, UInt64(updated))
+        push!(output_values, amplitude)
+    end
+    return nothing
+end
+
+@inline _apply_compiled_user_actions!(
+    input_states::Vector{UInt64},
+    input_values::Vector{T},
+    output_states::Vector{UInt64},
+    output_values::Vector{T},
+    ::Dict{UInt64,Int},
+    ::Tuple{},
+) where {T<:Number} = (input_states, input_values)
+
+@inline function _apply_compiled_user_actions!(
+    input_states::Vector{UInt64},
+    input_values::Vector{T},
+    output_states::Vector{UInt64},
+    output_values::Vector{T},
+    output_lookup::Dict{UInt64,Int},
+    actions::Tuple,
+) where {T<:Number}
+    empty!(output_states)
+    empty!(output_values)
+    _apply_compiled_user_action!(
+        output_states,
+        output_values,
+        output_lookup,
+        first(actions),
+        input_states,
+        input_values,
+    )
+    return _apply_compiled_user_actions!(
+        output_states,
+        output_values,
+        input_states,
+        input_values,
+        output_lookup,
+        Base.tail(actions),
+    )
+end
+
+@inline function _accumulate_user_term_column!(
+    touched::Vector{Int},
+    markers::Vector{Int},
+    accumulated::Vector{T},
+    term::_CompiledUserTerm{T},
+    initial::UInt64,
+    column::Int,
+    lookup::Dict{UInt64,Int},
+    first_states::Vector{UInt64},
+    first_values::Vector{T},
+    second_states::Vector{UInt64},
+    second_values::Vector{T},
+    branch_lookup::Dict{UInt64,Int},
+) where {T<:Number}
+    for transition in term.transitions
+        empty!(first_states)
+        empty!(first_values)
+        push!(first_states, initial)
+        push!(first_values, transition.coefficient)
+        branch_states, branch_values = _apply_compiled_user_actions!(
+            first_states,
+            first_values,
+            second_states,
+            second_values,
+            branch_lookup,
+            transition.actions,
+        )
+        @inbounds for branch in eachindex(branch_states)
+            row = get(lookup, branch_states[branch], 0)
+            iszero(row) && continue
+            if markers[row] == column
+                accumulated[row] += branch_values[branch]
+            else
+                markers[row] = column
+                accumulated[row] = branch_values[branch]
+                push!(touched, row)
+            end
+        end
+    end
+    return nothing
+end
+
+function _user_operator_csc(
+    basis::UserBasis,
+    specifications,
+    ::Type{T}=ComplexF64,
+) where {T<:Number}
+    _has_symmetry(basis.base.symmetry) &&
+        throw(ArgumentError(
+            "direct UserBasis CSC assembly requires an unreduced basis",
+        ))
+    compiled_terms = Any[]
+    for (opstring, couplings) in specifications
+        term = _compile_user_term(
+            basis,
+            opstring,
+            couplings,
+            T,
+        )
+        term === nothing || push!(compiled_terms, term)
+    end
+
+    return _assemble_compiled_user_csc(
+        basis,
+        Tuple(compiled_terms),
+        T,
+    )
+end
+
+function _assemble_compiled_user_csc(
+    basis::UserBasis,
+    compiled_terms::Tuple,
+    ::Type{T},
+) where {T<:Number}
+    dimension = length(basis)
+    column_pointers = Vector{Int}(undef, dimension + 1)
+    column_pointers[1] = 1
+    row_values = Int[]
+    nonzeros = T[]
+    touched = Int[]
+    markers = zeros(Int, dimension)
+    accumulated = zeros(T, dimension)
+    first_states = UInt64[]
+    first_values = T[]
+    second_states = UInt64[]
+    second_values = T[]
+    branch_lookup = Dict{UInt64,Int}()
+    sizehint!(touched, length(compiled_terms))
+    sizehint!(first_states, 16)
+    sizehint!(first_values, 16)
+    sizehint!(second_states, 16)
+    sizehint!(second_values, 16)
+
+    @inbounds for column in eachindex(basis.base.encoded_states)
+        empty!(touched)
+        initial = basis.base.encoded_states[column]
+        for term in compiled_terms
+            _accumulate_user_term_column!(
+                touched,
+                markers,
+                accumulated,
+                term,
+                initial,
+                column,
+                basis.base.lookup,
+                first_states,
+                first_values,
+                second_states,
+                second_values,
+                branch_lookup,
+            )
+        end
+        sort!(touched)
+        for row in touched
+            value = accumulated[row]
+            iszero(value) && continue
+            push!(row_values, row)
+            push!(nonzeros, value)
+        end
+        column_pointers[column + 1] = length(row_values) + 1
+    end
+    return SparseMatrixCSC{T,Int}(
+        dimension,
+        dimension,
+        column_pointers,
+        row_values,
+        nonzeros,
+    )
+end
+
 function _apply_user_definition!(
     next_branches::Dict{UInt64,ComplexF64},
     definition::AbstractMatrix,
@@ -612,14 +1006,10 @@ function operator_matrix(
             basis.base.symmetry.projector
         return sparse ? projected : Matrix(projected)
     end
-    rows, columns, values =
-        _user_operator_triplets(basis, opstring, couplings)
-    matrix = SparseArrays.sparse(
-        rows,
-        columns,
-        values,
-        length(basis),
-        length(basis),
+    matrix = _user_operator_csc(
+        basis,
+        ((opstring, couplings),),
+        ComplexF64,
     )
     return sparse ? matrix : Matrix(matrix)
 end
@@ -630,9 +1020,18 @@ function inplace_op!(out, basis::UserBasis, opstring, couplings)
     if _has_symmetry(basis.base.symmetry)
         out .+= operator_matrix(basis, opstring, couplings)
     else
-        rows, columns, values =
-            _user_operator_triplets(basis, opstring, couplings)
-        _accumulate_triplets!(out, rows, columns, values)
+        matrix = _user_operator_csc(
+            basis,
+            ((opstring, couplings),),
+            ComplexF64,
+        )
+        rows = rowvals(matrix)
+        values = nonzeros(matrix)
+        for column in axes(matrix, 2)
+            for pointer in nzrange(matrix, column)
+                out[rows[pointer], column] += values[pointer]
+            end
+        end
     end
     return out
 end

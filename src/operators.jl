@@ -517,6 +517,17 @@ function _assemble(
             T,
         )
         return _matrix_with_format(matrix, T, format; copy_data=false)
+    elseif basis isa Basis.UserBasis &&
+           !Basis._has_symmetry(basis.base.symmetry)
+        specifications = (
+            (term.op, term.couplings) for term in terms
+        )
+        matrix = Basis._user_operator_csc(
+            basis,
+            specifications,
+            T,
+        )
+        return _matrix_with_format(matrix, T, format; copy_data=false)
     elseif !(basis isa SpinBasis1D)
         matrix = spzeros(ComplexF64, length(basis), length(basis))
         for term in terms
