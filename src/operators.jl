@@ -22,6 +22,7 @@ include("sparse_formats.jl")
 
 export DIAMatrix, SparseMatrixCSR
 export ExpOp, Hamiltonian, OperatorTerm, anti_commutator, commutator
+export LindbladGenerator, lindblad_action!
 export QuantumLinearOperator, isquantum_LinearOperator, set_diagonal!
 export QuantumOperator, get_operators, isquantum_operator, tohamiltonian
 export load_zip, save_zip
@@ -74,6 +75,140 @@ mutable struct Hamiltonian{T<:Number}
     data::NativeMatrix{T}
     dynamic_terms::Vector{Tuple{NativeMatrix{T},Any,Tuple}}
     hermitian::Union{Nothing,Bool}
+end
+
+"""
+    LindbladGenerator(H, jumps)
+
+Matrix-free Lindblad generator for a static Hamiltonian `H` and jump
+operators `jumps`. It acts on column-major `vec(rho)` without materializing
+the `d^2 x d^2` Liouvillian. Use [`lindblad_action!`](@ref) for density
+matrices or `generator * vec(rho)` for linear-operator workflows.
+"""
+struct LindbladGenerator{T,H,J,K}
+    hamiltonian::H
+    jumps::J
+    jump_products::K
+    dimension::Int
+end
+
+function _lindblad_matrix(operator::Hamiltonian)
+    isempty(operator.dynamic_terms) ||
+        throw(ArgumentError("LindbladGenerator requires a static Hamiltonian"))
+    return tocsc(operator; time=0)
+end
+
+_lindblad_matrix(operator::AbstractMatrix) = operator
+
+function LindbladGenerator(H, jumps)
+    hamiltonian = _lindblad_matrix(H)
+    size(hamiltonian, 1) == size(hamiltonian, 2) ||
+        throw(DimensionMismatch("H must be square"))
+    normalized_jumps = map(_lindblad_matrix, collect(jumps))
+    dimension = size(hamiltonian, 1)
+    all(size(jump) == (dimension, dimension) for jump in normalized_jumps) ||
+        throw(DimensionMismatch("all jump operators must match H"))
+    jump_products = map(jump -> adjoint(jump) * jump, normalized_jumps)
+    T = promote_type(
+        ComplexF64,
+        eltype(hamiltonian),
+        (eltype(jump) for jump in normalized_jumps)...,
+    )
+    return LindbladGenerator{T,typeof(hamiltonian),typeof(normalized_jumps),typeof(jump_products)}(
+        hamiltonian,
+        normalized_jumps,
+        jump_products,
+        dimension,
+    )
+end
+
+Base.size(generator::LindbladGenerator) =
+    (generator.dimension^2, generator.dimension^2)
+Base.size(generator::LindbladGenerator, axis::Integer) = size(generator)[axis]
+Base.eltype(::Type{<:LindbladGenerator{T}}) where {T} = T
+Base.eltype(generator::LindbladGenerator) = eltype(typeof(generator))
+
+"""
+    lindblad_action!(out, generator, rho)
+
+Evaluate `-im[H,rho] + sum(D[J](rho))` in-place without constructing a full
+Liouvillian matrix.
+"""
+function lindblad_action!(
+    out::AbstractMatrix,
+    generator::LindbladGenerator,
+    rho::AbstractMatrix,
+)
+    dimension = generator.dimension
+    size(rho) == (dimension, dimension) ||
+        throw(DimensionMismatch("rho must match the generator dimension"))
+    size(out) == size(rho) ||
+        throw(DimensionMismatch("out and rho must have the same shape"))
+    input = Base.mightalias(out, rho) ? copy(rho) : rho
+    hamiltonian = generator.hamiltonian
+    mul!(out, hamiltonian, input, -im, false)
+    mul!(out, input, hamiltonian, im, true)
+    temporary = similar(out)
+    for (jump, product) in zip(generator.jumps, generator.jump_products)
+        mul!(temporary, jump, input)
+        mul!(out, temporary, adjoint(jump), true, true)
+        mul!(out, product, input, -0.5, true)
+        mul!(out, input, product, -0.5, true)
+    end
+    return out
+end
+
+function LinearAlgebra.mul!(
+    out::AbstractVector,
+    generator::LindbladGenerator,
+    rho::AbstractVector,
+    alpha::Number,
+    beta::Number,
+)
+    length(rho) == size(generator, 2) ||
+        throw(DimensionMismatch("rho vector has the wrong length"))
+    length(out) == size(generator, 1) ||
+        throw(DimensionMismatch("out vector has the wrong length"))
+    input = Base.mightalias(out, rho) ? copy(rho) : rho
+    action = Matrix{promote_type(eltype(generator), eltype(rho))}(
+        undef,
+        generator.dimension,
+        generator.dimension,
+    )
+    lindblad_action!(
+        action,
+        generator,
+        reshape(input, generator.dimension, generator.dimension),
+    )
+    iszero(beta) ? fill!(out, zero(eltype(out))) : lmul!(beta, out)
+    axpy!(alpha, vec(action), out)
+    return out
+end
+
+LinearAlgebra.mul!(
+    out::AbstractVector,
+    generator::LindbladGenerator,
+    rho::AbstractVector,
+) = mul!(out, generator, rho, true, false)
+
+function Base.:*(generator::LindbladGenerator, rho::AbstractVector)
+    out = zeros(
+        promote_type(eltype(generator), eltype(rho)),
+        size(generator, 1),
+    )
+    return mul!(out, generator, rho)
+end
+
+function Base.Matrix(generator::LindbladGenerator)
+    dimension = size(generator, 1)
+    matrix = Matrix{eltype(generator)}(undef, dimension, dimension)
+    input = zeros(eltype(generator), dimension)
+    for column in 1:dimension
+        fill!(input, zero(eltype(input)))
+        input[column] = one(eltype(input))
+        mul!(@view(matrix[:, column]), generator, input)
+    end
+    return matrix
 end
 
 function _consolidate_terms(terms::AbstractVector{<:OperatorTerm})

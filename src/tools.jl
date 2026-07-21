@@ -14,9 +14,11 @@ using ..Basis:
     projection_matrix
 using ..Operators:
     Hamiltonian,
+    LindbladGenerator,
     OperatorTerm,
     _krylov_expmv,
     _krylov_expmv_times,
+    lindblad_action!,
     tocsc,
     toarray
 import ..Basis: ent_entropy
@@ -27,12 +29,265 @@ export mean_level_spacing, project_op
 export ed_state_vs_time, expm_lanczos, lanczos_full, lanczos_iter, lin_comb_Q_T
 export ftlm_static_iteration, ltlm_static_iteration
 export diag_ensemble, ent_entropy, obs_vs_time
+export dynamical_correlator, spectral_function
+export subspace_fidelity, track_eigenspaces
 export evolve
 export ExpmMultiplyParallel, expm_multiply_parallel
 export FloquetTimeVector, get_coordinates
 export Floquet
 export BlockOps, block_diag_hamiltonian, block_expm
 export compute_all_blocks!, update_blocks!
+
+function _static_workflow_operator(operator::Hamiltonian)
+    isempty(operator.dynamic_terms) ||
+        throw(ArgumentError("workflow analysis requires a static Hamiltonian"))
+    return operator.data
+end
+
+_static_workflow_operator(operator::AbstractMatrix) = operator
+
+function _workflow_matrix(operator::Hamiltonian)
+    isempty(operator.dynamic_terms) ||
+        throw(ArgumentError("workflow analysis requires a static operator"))
+    return operator.data
+end
+
+_workflow_matrix(operator::AbstractMatrix) = operator
+
+"""
+    dynamical_correlator(H, state, A, B, times; connected=false, ...)
+
+Compute `C(t) = <state|A(t)B|state>` for a static Hamiltonian using Krylov
+time evolution. With `connected=true`, subtract
+`<A(t)><B(0)>`. `A` and `B` may be matrices or static `Hamiltonian`s.
+"""
+function dynamical_correlator(
+    H,
+    state::AbstractVector,
+    A,
+    B,
+    times;
+    connected::Bool=false,
+    tol::Real=1e-12,
+    krylov_dim::Integer=30,
+)
+    operator = _static_workflow_operator(H)
+    left_operator = _workflow_matrix(A)
+    right_operator = _workflow_matrix(B)
+    dimension = length(state)
+    size(operator) == (dimension, dimension) ||
+        throw(DimensionMismatch("H and state dimensions do not match"))
+    size(left_operator) == (dimension, dimension) ||
+        throw(DimensionMismatch("A and state dimensions do not match"))
+    size(right_operator) == (dimension, dimension) ||
+        throw(DimensionMismatch("B and state dimensions do not match"))
+    time_values = collect(times)
+    scales = -im .* time_values
+    left_states = _krylov_expmv_times(
+        operator,
+        state,
+        scales;
+        tol,
+        krylov_dim,
+    )
+    right_initial = right_operator * state
+    right_states = _krylov_expmv_times(
+        operator,
+        right_initial,
+        scales;
+        tol,
+        krylov_dim,
+    )
+    T = promote_type(eltype(left_states), eltype(right_states))
+    result = Vector{T}(undef, length(time_values))
+    right_expectation = connected ? dot(state, right_initial) : zero(T)
+    for index in eachindex(time_values)
+        left_state = @view left_states[:, index]
+        right_state = @view right_states[:, index]
+        result[index] = dot(left_state, left_operator * right_state)
+        if connected
+            result[index] -=
+                dot(left_state, left_operator * left_state) * right_expectation
+        end
+    end
+    return result
+end
+
+function _spectral_vectors(state, operator, left_operator)
+    right = _workflow_matrix(operator) * state
+    left = _workflow_matrix(left_operator) * state
+    length(left) == length(right) ||
+        throw(DimensionMismatch("left and right spectral vectors must match"))
+    return left, right
+end
+
+"""
+    spectral_function(H, state, operator, frequencies; left_operator=operator,
+                      reference_energy=0, broadening=0.05,
+                      method=:krylov, krylov_dim=30)
+
+Compute the broadened response
+`-Im <a|(omega + i*eta + Eref - H)^(-1)|b> / pi`, where
+`|b> = operator*state` and `|a> = left_operator*state`. `operator` may be
+rectangular, so the target Hamiltonian can live in a different particle or
+symmetry sector. Supported methods are full `:lehmann`, projected
+`:krylov`, and direct `:resolvent` solves.
+"""
+function spectral_function(
+    H,
+    state::AbstractVector,
+    operator,
+    frequencies;
+    left_operator=operator,
+    reference_energy::Real=0,
+    broadening::Real=0.05,
+    method=:krylov,
+    krylov_dim::Integer=30,
+)
+    broadening > 0 || throw(ArgumentError("broadening must be positive"))
+    target = _static_workflow_operator(H)
+    size(target, 1) == size(target, 2) ||
+        throw(DimensionMismatch("target Hamiltonian must be square"))
+    left, right = _spectral_vectors(state, operator, left_operator)
+    length(right) == size(target, 1) ||
+        throw(DimensionMismatch("operator output must match target Hamiltonian"))
+    frequency_values = collect(frequencies)
+    normalized_method = Symbol(method)
+    normalized_method in (:lehmann, :krylov, :resolvent) ||
+        throw(ArgumentError("method must be :lehmann, :krylov, or :resolvent"))
+    normalized_method in (:lehmann, :krylov) && !ishermitian(target) &&
+        throw(ArgumentError("Lehmann and Krylov spectra require a Hermitian target"))
+    (iszero(norm(left)) || iszero(norm(right))) &&
+        return zeros(Float64, length(frequency_values))
+    response = Vector{ComplexF64}(undef, length(frequency_values))
+
+    if normalized_method === :lehmann
+        decomposition = eigen(Hermitian(Matrix(target)))
+        left_coefficients = decomposition.vectors' * left
+        right_coefficients = decomposition.vectors' * right
+        for (index, frequency) in pairs(frequency_values)
+            z = frequency + im * broadening + reference_energy
+            response[index] = sum(
+                conj(left_coefficients[level]) * right_coefficients[level] /
+                (z - decomposition.values[level])
+                for level in eachindex(decomposition.values)
+            )
+        end
+    elseif normalized_method === :resolvent
+        identity_matrix = sparse(I, size(target, 1), size(target, 2))
+        for (index, frequency) in pairs(frequency_values)
+            z = frequency + im * broadening + reference_energy
+            response[index] = dot(left, (z .* identity_matrix - target) \ right)
+        end
+    elseif length(right) == 1
+        for (index, frequency) in pairs(frequency_values)
+            z = frequency + im * broadening + reference_energy
+            response[index] = conj(left[1]) * right[1] / (z - target[1, 1])
+        end
+    else
+        steps = min(Int(krylov_dim), length(right) - 1)
+        steps > 0 || throw(ArgumentError("krylov_dim must be positive"))
+        energies, vectors, basis = lanczos_full(
+            target,
+            right,
+            steps;
+            full_ortho=true,
+        )
+        initial_coordinates = zeros(ComplexF64, length(energies))
+        initial_coordinates[1] = norm(right)
+        reduced_right = vectors' * initial_coordinates
+        reduced_left = vectors' * (conj.(basis) * left)
+        for (index, frequency) in pairs(frequency_values)
+            z = frequency + im * broadening + reference_energy
+            response[index] = sum(
+                conj(reduced_left[level]) * reduced_right[level] /
+                (z - energies[level])
+                for level in eachindex(energies)
+            )
+        end
+    end
+    return -imag.(response) ./ pi
+end
+
+function _orthonormal_subspace(space::AbstractVector)
+    norm(space) > 0 || throw(ArgumentError("subspace vector must be nonzero"))
+    return reshape(space / norm(space), :, 1)
+end
+
+function _orthonormal_subspace(space::AbstractMatrix)
+    size(space, 2) > 0 ||
+        throw(ArgumentError("subspace must contain at least one vector"))
+    size(space, 1) >= size(space, 2) ||
+        throw(DimensionMismatch("subspace cannot have more columns than rows"))
+    factorization = qr(space)
+    diagonal_values = abs.(diag(factorization.R))
+    all(>(100eps(Float64)), diagonal_values) ||
+        throw(ArgumentError("subspace columns must be linearly independent"))
+    return Matrix(factorization.Q)[:, 1:size(space, 2)]
+end
+
+"""
+    subspace_fidelity(left, right; aggregate=:minimum, squared=false)
+
+Gauge-invariant fidelity between equally sized subspaces. Singular values of
+`Qleft'Qright` are the principal-angle fidelities. `aggregate` may be
+`:minimum`, `:mean`, `:product`, or `:all`.
+"""
+function subspace_fidelity(
+    left::AbstractVecOrMat,
+    right::AbstractVecOrMat;
+    aggregate=:minimum,
+    squared::Bool=false,
+)
+    size(left, 1) == size(right, 1) ||
+        throw(DimensionMismatch("subspaces must share an ambient dimension"))
+    left_space = _orthonormal_subspace(left)
+    right_space = _orthonormal_subspace(right)
+    size(left_space, 2) == size(right_space, 2) ||
+        throw(DimensionMismatch("subspaces must have the same dimension"))
+    values = clamp.(svdvals(left_space' * right_space), 0, 1)
+    squared && (values = values .^ 2)
+    normalized = Symbol(aggregate)
+    normalized === :all && return values
+    normalized === :minimum && return minimum(values)
+    normalized === :mean && return sum(values) / length(values)
+    normalized === :product && return prod(values)
+    throw(ArgumentError("aggregate must be :minimum, :mean, :product, or :all"))
+end
+
+"""
+    track_eigenspaces(spaces)
+
+Parallel-transport a sequence of equal-dimensional eigenspaces using the
+unitary Procrustes solution. Returns aligned `spaces`, adjacent principal
+fidelities, and singular values. Rotations inside degenerate subspaces are
+removed without assigning physically meaningless individual eigenvectors.
+"""
+function track_eigenspaces(spaces)
+    collected = collect(spaces)
+    isempty(collected) && throw(ArgumentError("spaces must be nonempty"))
+    tracked = Matrix[_orthonormal_subspace(first(collected))]
+    singular_values = Vector{Vector{Float64}}()
+    fidelities = Float64[]
+    for raw_space in Iterators.drop(collected, 1)
+        current = _orthonormal_subspace(raw_space)
+        previous = last(tracked)
+        size(current) == size(previous) ||
+            throw(DimensionMismatch("all spaces must have the same shape"))
+        decomposition = svd(previous' * current)
+        rotation = decomposition.V * decomposition.U'
+        aligned = current * rotation
+        values = Float64.(clamp.(decomposition.S, 0, 1))
+        push!(tracked, aligned)
+        push!(singular_values, values)
+        push!(fidelities, minimum(values))
+    end
+    return (
+        spaces=tracked,
+        fidelities=fidelities,
+        singular_values=singular_values,
+    )
+end
 
 """
     kl_div(p1, p2)
@@ -1304,6 +1559,40 @@ function evolve(
     scalar_target && return first(outputs)
     first(outputs) isa AbstractVector && return reduce(hcat, outputs)
     return cat(outputs...; dims=ndims(first(outputs)) + 1)
+end
+
+"""
+    evolve(generator::LindbladGenerator, rho0, t0, times; ...)
+
+Evolve a density matrix under a matrix-free Lindblad generator using the
+existing adaptive ODE backend. The returned shape follows density-matrix
+Hamiltonian evolution: a matrix for a scalar time and a three-dimensional
+array for a time grid.
+"""
+function evolve(
+    generator::LindbladGenerator,
+    rho0::AbstractMatrix,
+    t0::Real,
+    times;
+    kwargs...,
+)
+    dimension = generator.dimension
+    size(rho0) == (dimension, dimension) ||
+        throw(DimensionMismatch("rho0 must match the generator dimension"))
+    isapprox(tr(rho0), one(tr(rho0)); atol=1e-10, rtol=1e-10) ||
+        throw(ArgumentError("rho0 must have unit trace"))
+    isapprox(rho0, rho0'; atol=1e-10, rtol=1e-10) ||
+        throw(ArgumentError("rho0 must be Hermitian"))
+    rhs! = (out, time, rho, selected_generator) ->
+        lindblad_action!(out, selected_generator, rho)
+    return evolve(
+        ComplexF64.(rho0),
+        t0,
+        times,
+        rhs!;
+        f_params=(generator,),
+        kwargs...,
+    )
 end
 
 """

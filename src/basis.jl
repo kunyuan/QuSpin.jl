@@ -12,6 +12,7 @@ export BosonBasis1D, BosonBasisGeneral
 export SpinlessFermionBasis1D, SpinlessFermionBasisGeneral
 export SpinfulFermionBasis1D, SpinfulFermionBasisGeneral
 export HOBasis, TensorBasis, PhotonBasis, UserBasis
+export constraint_states
 export UInt256, UInt1024, UInt4096, UInt16384
 export basis_int_to_python_int, basis_ones, basis_zeros
 export bitwise_and, bitwise_leftshift, bitwise_not, bitwise_or

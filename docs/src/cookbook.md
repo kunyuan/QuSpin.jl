@@ -94,3 +94,63 @@ v0 = normalize!(ones(Float64, length(basis)))
 values, vectors = eigsh(H; k=4, which=:SA, v0=v0, tol=1e-10)
 @assert norm(H * vectors - vectors * Diagonal(values)) < 1e-7
 ```
+
+## Workflow analysis primitives
+
+Time-domain two-point functions and broadened response spectra share the same
+static Hamiltonian and operator objects used elsewhere in the package:
+
+```julia
+times = range(0, 5; length=101)
+correlation = dynamical_correlator(H, psi0, A, B, times)
+
+frequencies = range(0, 4; length=201)
+spectrum = spectral_function(
+    H,
+    psi0,
+    B,
+    frequencies;
+    reference_energy=E0,
+    broadening=0.05,
+    method=:krylov,
+)
+```
+
+For particle-addition/removal spectra, `B` may be rectangular. Its output
+dimension must match the target-sector Hamiltonian. Construct the rectangular
+action with `op_shift_sector(target, source, terms, I)`.
+
+Track a degenerate eigenspace without assigning gauge-dependent individual
+eigenvectors:
+
+```julia
+tracked = track_eigenspaces(spaces)
+minimum_overlap = subspace_fidelity(spaces[1], spaces[2])
+```
+
+## Locally constrained bases
+
+Generate allowed states by pruning invalid prefixes, then reuse the ordinary
+`UserBasis` operator machinery:
+
+```julia
+allowed = constraint_states(
+    20;
+    prefix_allowed=(occupation, site) ->
+        site == 1 || occupation[site - 1] + occupation[site] <= 1,
+)
+basis = UserBasis(UInt64, 20, op_dict; states=allowed)
+```
+
+This is a generic state generator rather than a model-specific PXP basis.
+
+## Matrix-free Lindblad dynamics
+
+```julia
+generator = LindbladGenerator(Hmatrix, jump_operators)
+rho_t = evolve(generator, rho0, 0.0, times; rtol=1e-9, atol=1e-11)
+```
+
+`LindbladGenerator` applies directly to `vec(rho)` and never materializes the
+full ``d^2 \times d^2`` Liouvillian. `Matrix(generator)` is available only for
+small-system validation.

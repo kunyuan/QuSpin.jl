@@ -49,6 +49,7 @@ using .Basis:
     bitwise_rightshift,
     bitwise_xor,
     coherent_state,
+    constraint_states,
     ent_entropy,
     expanded_form,
     get_vec,
@@ -80,6 +81,7 @@ using .Operators:
     DIAMatrix,
     ExpOp,
     Hamiltonian,
+    LindbladGenerator,
     OperatorTerm,
     QuantumLinearOperator,
     QuantumOperator,
@@ -105,6 +107,7 @@ using .Operators:
     isquantum_operator,
     load_zip,
     matrix_ele,
+    lindblad_action!,
     project_to,
     quant_fluct,
     right_apply,
@@ -131,6 +134,7 @@ using .Tools:
     ltlm_static_iteration,
     ed_state_vs_time,
     diag_ensemble,
+    dynamical_correlator,
     expm_lanczos,
     array_to_ints,
     block_diag_hamiltonian,
@@ -146,6 +150,9 @@ using .Tools:
     matvec,
     mean_level_spacing,
     obs_vs_time,
+    spectral_function,
+    subspace_fidelity,
+    track_eigenspaces,
     project_op,
     update_blocks!,
     expm_multiply_parallel
@@ -171,12 +178,14 @@ export basis_int_to_python_int, basis_ones, basis_zeros
 export bitwise_and, bitwise_leftshift, bitwise_not, bitwise_or
 export bitwise_rightshift, bitwise_xor
 export coherent_state, get_basis_type, photon_Hspace_dim
+export constraint_states
 export ent_entropy, partial_trace, projection_matrix, python_int_to_basis_int
 export expanded_form, get_vec, project_from
 export check_hermitian, check_pcon, check_symm, get_amp, inplace_op!
 export make_basis!, make_basis_blocks, normalization
 export op_bra_ket, op_shift_sector, operator_matrix, representative
 export anti_commutator, commutator
+export LindbladGenerator, lindblad_action!
 export apply, get_mat, isexp_op, right_apply, sandwich
 export set_a!, set_grid!, set_iterate!, unset_grid!
 export as_dense_format, as_sparse_format, astype, diagonal, eigh, eigsh
@@ -188,6 +197,8 @@ export rotate_by, toarray, tocsc, tocsr, todense, update_matrix_formats!
 export array_to_ints, get_matvec_function, ints_to_array, kl_div, matvec
 export mean_level_spacing, project_op
 export diag_ensemble, obs_vs_time
+export dynamical_correlator, spectral_function
+export subspace_fidelity, track_eigenspaces
 export ed_state_vs_time, expm_lanczos, lanczos_full, lanczos_iter, lin_comb_Q_T
 export ftlm_static_iteration, ltlm_static_iteration
 export eigvals, state_at, state_index, states
