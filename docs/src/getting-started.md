@@ -6,13 +6,13 @@ QuSpin.jl currently installs directly from GitHub:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/kunyuan/QuSpin.jl")
+Pkg.add(url="https://github.com/matrixlab-research/QuSpin.jl")
 ```
 
 For development, clone the repository and instantiate its environment:
 
 ```sh
-git clone https://github.com/kunyuan/QuSpin.jl.git
+git clone https://github.com/matrixlab-research/QuSpin.jl.git
 cd QuSpin.jl
 julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
 ```
