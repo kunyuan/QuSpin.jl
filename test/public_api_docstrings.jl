@@ -8,6 +8,7 @@
     )
     @test length(exported) == 131
     for name in exported
-        @test Docs.hasdoc(QuSpin, name)
+        binding = Docs.Binding(QuSpin, name)
+        @test Docs.doc(binding) !== nothing
     end
 end

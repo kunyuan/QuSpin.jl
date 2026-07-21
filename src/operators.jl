@@ -3692,6 +3692,20 @@ end
     ::AbstractDict{K,V},
 ) where {T,K,V} = promote_type(T, V)
 
+function _dense_parameter_matrix(
+    operator::QuantumOperator{T},
+    pars::AbstractDict{K,V},
+) where {T,K,V}
+    _check_quantum_parameters(operator, pars)
+    R = promote_type(T, V)
+    result = zeros(R, size(operator)...)
+    for (key, matrix) in operator.components
+        coefficient = get(pars, key, one(R))
+        iszero(coefficient) || (result .+= coefficient .* matrix)
+    end
+    return result
+end
+
 function _parameter_matrix(
     operator::QuantumOperator,
     pars::AbstractDict=Dict{Any,eltype(operator)}(),
@@ -3707,10 +3721,15 @@ function _parameter_matrix(
     return result
 end
 
-Base.size(operator::QuantumOperator) = size(first(values(operator.components)))
-Base.size(operator::QuantumOperator, dimension::Integer) =
-    size(first(values(operator.components)), dimension)
-Base.eltype(operator::QuantumOperator) = eltype(first(values(operator.components)))
+function Base.size(operator::QuantumOperator)
+    matrix = first(values(getfield(operator, :components)))
+    return (Int(size(matrix, 1)), Int(size(matrix, 2)))
+end
+function Base.size(operator::QuantumOperator, dimension::Integer)
+    matrix = first(values(getfield(operator, :components)))
+    return Int(size(matrix, dimension))
+end
+Base.eltype(::QuantumOperator{T}) where {T} = T
 
 function Base.getproperty(operator::QuantumOperator, name::Symbol)
     name === :H && return adjoint(operator)
@@ -3837,12 +3856,13 @@ function astype(
     )
 end
 
-toarray(
+function toarray(
     operator::QuantumOperator;
     pars::AbstractDict=Dict{Any,eltype(operator)}(),
     out=nothing,
-) =
-    _copy_or_write(Matrix(_parameter_matrix(operator, pars)), out)
+)
+    return _copy_or_write(_dense_parameter_matrix(operator, pars), out)
+end
 todense(operator::QuantumOperator; kwargs...) = toarray(operator; kwargs...)
 tocsc(
     operator::QuantumOperator;
