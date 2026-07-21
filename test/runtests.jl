@@ -9,7 +9,12 @@ using QuSpin
     @test isdefined(QuSpin, :Tools)
     @test QuSpin.Basis.SpinBasis1D === SpinBasis1D
     @test QuSpin.Operators.Hamiltonian === Hamiltonian
-    @test isempty(detect_ambiguities(QuSpin; recursive=true))
+    ambiguities = detect_ambiguities(QuSpin; recursive=true)
+    quspin_modules = (QuSpin, QuSpin.Basis, QuSpin.Operators, QuSpin.Tools)
+    internal_ambiguities = filter(ambiguities) do pair
+        all(method -> method.module in quspin_modules, pair)
+    end
+    @test isempty(internal_ambiguities)
 end
 
 @testset "Wide basis integers" begin

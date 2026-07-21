@@ -38,12 +38,18 @@
     @test csr.data * columns ≈ csc.data * columns atol=2e-14
     @test dia.data * columns ≈ csc.data * columns atol=2e-14
 
+    dimension = length(basis)
+    diagonal = collect(range(0.5, 1.5; length=dimension))
+    off_diagonal = collect(range(-0.2, 0.2; length=dimension - 1))
     structured_right = (
-        Diagonal(range(0.5, 1.5; length=length(basis))),
+        Bidiagonal(diagonal, off_diagonal, :U),
+        Diagonal(diagonal),
+        SymTridiagonal(diagonal, off_diagonal),
+        Tridiagonal(off_diagonal, diagonal, reverse(off_diagonal)),
         UpperTriangular(reshape(
-            range(-0.2, 0.4; length=length(basis)^2),
-            length(basis),
-            length(basis),
+            range(-0.2, 0.4; length=dimension^2),
+            dimension,
+            dimension,
         )),
     )
     for right in structured_right
