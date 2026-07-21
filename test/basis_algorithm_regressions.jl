@@ -6,6 +6,159 @@ using QuSpin
 
 Random.seed!(0x51a7)
 
+function reference_discrete_csc(basis, specifications, ::Type{T}) where {T}
+    rows = Int[]
+    columns = Int[]
+    values = T[]
+    for (opstring, couplings) in specifications
+        term_rows, term_columns, term_values =
+            QuSpin.Basis._discrete_operator_triplets(
+                basis,
+                opstring,
+                couplings,
+            )
+        append!(rows, term_rows)
+        append!(columns, term_columns)
+        append!(values, T.(term_values))
+    end
+    return sparse(rows, columns, values, length(basis), length(basis))
+end
+
+@testset "generic transition-to-CSC assembly" begin
+    cases = [
+        (
+            BosonBasis1D(4; Nb=3, sps=3),
+            [
+                ("+-", [(0.7, 1, 2), (-0.2, 3, 4)]),
+                ("n", [(0.3, site) for site in 1:4]),
+            ],
+            Float64,
+        ),
+        (
+            SpinBasis1D(4; S=1, Nup=4),
+            [
+                ("+-", [(0.4, 1, 2), (-0.6, 3, 4)]),
+                ("zz", [(0.2, 1, 3), (-0.1, 2, 4)]),
+                ("y", [(0.3, 2)]),
+            ],
+            ComplexF64,
+        ),
+        (
+            SpinlessFermionBasis1D(6; Nf=3),
+            [
+                ("+-", [(0.8, 1, 2), (-0.4, 4, 6)]),
+                ("n", [(0.25, site) for site in 1:6]),
+            ],
+            Float64,
+        ),
+        (
+            SpinlessFermionBasis1D(4),
+            [
+                ("x", [(0.3, 1), (-0.2, 4)]),
+                ("y", [(0.1, 2)]),
+            ],
+            ComplexF64,
+        ),
+        (
+            SpinfulFermionBasis1D(4; Nf=(2, 1)),
+            [
+                ("+-|", [(0.6, 1, 3), (-0.2, 2, 4)]),
+                ("|+-", [(0.5, 1, 4)]),
+                ("n|n", [(0.7, 2, 3)]),
+            ],
+            Float64,
+        ),
+    ]
+
+    for (basis, specifications, T) in cases
+        assembled = QuSpin.Basis._discrete_operator_csc(
+            basis,
+            specifications,
+            T,
+        )
+        reference = reference_discrete_csc(basis, specifications, T)
+        @test assembled == reference
+        @test all(
+            issorted(rowvals(assembled)[nzrange(assembled, column)])
+            for column in axes(assembled, 2)
+        )
+        @test all(!iszero, nonzeros(assembled))
+
+        terms = [OperatorTerm(opstring, couplings)
+                 for (opstring, couplings) in specifications]
+        @test Matrix(Hamiltonian(
+            basis,
+            terms;
+            static_fmt=:csc,
+            check_symm=false,
+            check_herm=false,
+            check_pcon=false,
+        )) ==
+            Matrix(reference)
+    end
+
+    randomized_cases = [
+        (BosonBasis1D(4; Nb=3, sps=3), ["+-", "-+", "n"]),
+        (SpinBasis1D(4; S=1, Nup=4), ["+-", "-+", "zz", "x", "y"]),
+        (SpinlessFermionBasis1D(5; Nf=2), ["+-", "-+", "nn"]),
+        (SpinlessFermionBasis1D(4), ["+", "-", "x", "y", "n"]),
+        (SpinfulFermionBasis1D(3), ["+-|", "|+-", "n|n", "x|", "|y"]),
+    ]
+    for _ in 1:8, (basis, opstrings) in randomized_cases
+        specifications = [
+            (
+                opstring,
+                [
+                    (
+                        randn() + im * randn(),
+                        (
+                            rand(1:basis.L)
+                            for _ in 1:count(!=('|'), opstring)
+                        )...,
+                    )
+                    for _ in 1:3
+                ],
+            )
+            for opstring in opstrings
+        ]
+        @test QuSpin.Basis._discrete_operator_csc(
+            basis,
+            specifications,
+            ComplexF64,
+        ) ≈ reference_discrete_csc(
+            basis,
+            specifications,
+            ComplexF64,
+        ) atol=2e-14
+    end
+
+    binary_bosons = BosonBasis1D(6; Nb=3, sps=2)
+    indexer = QuSpin.Basis._discrete_state_indexer(binary_bosons)
+    @test indexer isa QuSpin.Basis._CombinadicDiscreteStateIndexer
+    @test [
+        QuSpin.Basis._discrete_state_index(indexer, state)
+        for state in binary_bosons.encoded_states
+    ] == collect(1:length(binary_bosons))
+
+    spinless = SpinlessFermionBasis1D(6; Nf=3)
+    transitions = QuSpin.Basis._compile_discrete_transitions(
+        spinless,
+        (("+-", [(0.8, 1, 2), (-0.4, 4, 6)]),),
+        Float64,
+    )
+    spinless_indexer = QuSpin.Basis._discrete_state_indexer(spinless)
+    @test (@inferred QuSpin.Basis._assemble_discrete_csc(
+        spinless,
+        transitions,
+        spinless_indexer,
+    )) isa SparseMatrixCSC{Float64,Int}
+    @test (@inferred QuSpin.Basis._discrete_operator_csc(
+        spinless,
+        (("+-", [(0.8, 1, 2), (-0.4, 4, 6)]),),
+        Float64,
+    )) isa SparseMatrixCSC{Float64,Int}
+end
+
 @testset "lazy identity projection" begin
     spin = SpinBasis1D(12; nup=6)
     boson = BosonBasis1D(6; Nb=4, sps=3)
