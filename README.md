@@ -1,7 +1,7 @@
 # QuSpin.jl
 
-[![CI](https://github.com/kunyuan/QuSpin.jl/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/kunyuan/QuSpin.jl/actions/workflows/test.yml)
-[![Documentation](https://github.com/kunyuan/QuSpin.jl/actions/workflows/docs.yml/badge.svg?branch=main)](https://kunyuan.github.io/QuSpin.jl/dev/)
+[![CI](https://github.com/matrixlab-research/QuSpin.jl/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/matrixlab-research/QuSpin.jl/actions/workflows/test.yml)
+[![Documentation](https://github.com/matrixlab-research/QuSpin.jl/actions/workflows/docs.yml/badge.svg?branch=main)](https://matrixlab-research.github.io/QuSpin.jl/dev/)
 [![Julia 1.10+](https://img.shields.io/badge/Julia-1.10%2B-9558B2?logo=julia)](https://julialang.org/)
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
 
@@ -19,11 +19,11 @@ QuSpin.jl currently installs directly from GitHub:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/kunyuan/QuSpin.jl")
+Pkg.add(url="https://github.com/matrixlab-research/QuSpin.jl")
 ```
 
 The package supports Julia 1.10 and later. See the
-[development documentation](https://kunyuan.github.io/QuSpin.jl/dev/) for the
+[development documentation](https://matrixlab-research.github.io/QuSpin.jl/dev/) for the
 getting-started guide, complete tutorials, cookbook, benchmarks, and generated
 API reference.
 
