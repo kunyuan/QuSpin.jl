@@ -24,6 +24,24 @@ function reference_discrete_csc(basis, specifications, ::Type{T}) where {T}
     return sparse(rows, columns, values, length(basis), length(basis))
 end
 
+function reference_user_csc(basis, specifications)
+    rows = Int[]
+    columns = Int[]
+    values = ComplexF64[]
+    for (opstring, couplings) in specifications
+        term_rows, term_columns, term_values =
+            QuSpin.Basis._user_operator_triplets(
+                basis,
+                opstring,
+                couplings,
+            )
+        append!(rows, term_rows)
+        append!(columns, term_columns)
+        append!(values, term_values)
+    end
+    return sparse(rows, columns, values, length(basis), length(basis))
+end
+
 @testset "generic transition-to-CSC assembly" begin
     cases = [
         (
@@ -157,6 +175,86 @@ end
         (("+-", [(0.8, 1, 2), (-0.4, 4, 6)]),),
         Float64,
     )) isa SparseMatrixCSC{Float64,Int}
+end
+
+@testset "UserBasis direct transition-to-CSC assembly" begin
+    cycle = function (state, site)
+        weight = UInt64(3)^(site - 1)
+        old = Int((state ÷ weight) % UInt64(3))
+        new = mod(old + 1, 3)
+        updated = UInt64(
+            Int128(state) + Int128(new - old) * Int128(weight),
+        )
+        return updated, 0.5 - 0.25im
+    end
+    branching = ComplexF64[
+        1.0 0.5im 0.0
+        -0.25 1.0 0.75
+        0.5 0.0 -1.0im
+    ]
+    basis = UserBasis(
+        UInt64,
+        2,
+        Dict('a' => branching, 'c' => cycle);
+        sps=3,
+        states=UInt64[0, 1, 3, 4, 6, 7],
+        allowed_ops=('a', 'c'),
+    )
+    specifications = [
+        ("a", [(0.7 - 0.2im, 1), (-0.3, 2)]),
+        ("aa", [(0.4 + 0.1im, 1, 1)]),
+        ("c", [(1.1, 2)]),
+    ]
+    expected = reference_user_csc(basis, specifications)
+    assembled = @inferred QuSpin.Basis._user_operator_csc(
+        basis,
+        specifications,
+        ComplexF64,
+    )
+    @test assembled ≈ expected atol=2e-14
+    @test all(
+        issorted(rowvals(assembled)[nzrange(assembled, column)])
+        for column in axes(assembled, 2)
+    )
+    @test operator_matrix(
+        basis,
+        "aa",
+        [(0.4 + 0.1im, 1, 1)];
+        sparse=true,
+    ) == reference_user_csc(
+        basis,
+        [("aa", [(0.4 + 0.1im, 1, 1)])],
+    )
+
+    constrained = constraint_states(
+        16;
+        prefix_allowed=(occupations, site) ->
+            site == 1 ||
+            occupations[site - 1] + occupations[site] <= 1,
+        state_allowed=occupations ->
+            occupations[1] + occupations[end] <= 1,
+    )
+    pxp = UserBasis(
+        UInt64,
+        16,
+        Dict('x' => ComplexF64[0 1; 1 0]);
+        states=constrained,
+        allowed_ops=('x',),
+    )
+    pxp_specifications = [
+        ("x", [(1.0, site) for site in 1:16]),
+    ]
+    QuSpin.Basis._user_operator_csc(
+        pxp,
+        pxp_specifications,
+        Float64,
+    )
+    allocated = @allocated QuSpin.Basis._user_operator_csc(
+        pxp,
+        pxp_specifications,
+        Float64,
+    )
+    @test allocated < 10_000_000
 end
 
 @testset "lazy identity projection" begin

@@ -27,12 +27,93 @@ function benchmark_suite()
     @assert H.data isa SparseMatrixCSC
     @assert norm(H.data * vectors - vectors * Diagonal(values)) < 1e-7
 
+    constrained_length = 18
+    constrained_states = constraint_states(
+        constrained_length;
+        prefix_allowed=(occupations, site) ->
+            site == 1 ||
+            occupations[site - 1] + occupations[site] <= 1,
+        state_allowed=occupations ->
+            occupations[1] + occupations[end] <= 1,
+    )
+    constrained_user = UserBasis(
+        UInt64,
+        constrained_length,
+        Dict('x' => ComplexF64[0 1; 1 0]);
+        states=constrained_states,
+        allowed_ops=('x',),
+    )
+    constrained_terms = [
+        OperatorTerm(
+            "x",
+            [(1.0, site) for site in 1:constrained_length],
+        ),
+    ]
+    constrained_matrix = Hamiltonian(
+        constrained_user,
+        constrained_terms;
+        static_fmt=:csc,
+        check_symm=false,
+        check_herm=false,
+        check_pcon=false,
+    )
+    @assert length(constrained_user) == 5_778
+    @assert constrained_matrix.data isa SparseMatrixCSC
+    @assert ishermitian(constrained_matrix.data)
+
+    nonbinary_length = 7
+    nonbinary_user = UserBasis(
+        UInt64,
+        nonbinary_length,
+        Dict('q' => ComplexF64[0 1 0; 1 0 1; 0 1 0]);
+        sps=3,
+        states=UInt64.(0:(3^nonbinary_length - 1)),
+        allowed_ops=('q',),
+    )
+    nonbinary_terms = [
+        OperatorTerm(
+            "q",
+            [(1.0, site) for site in 1:nonbinary_length],
+        ),
+    ]
+    nonbinary_matrix = Hamiltonian(
+        nonbinary_user,
+        nonbinary_terms;
+        static_fmt=:csc,
+        check_symm=false,
+        check_herm=false,
+        check_pcon=false,
+    )
+    @assert length(nonbinary_user) == 3^nonbinary_length
+    @assert nonbinary_matrix.data isa SparseMatrixCSC
+    @assert ishermitian(nonbinary_matrix.data)
+
     return Dict(
         "fixed-weight basis construction" => @benchmarkable(
             SpinBasis1D($L; nup=$L ÷ 2, pauli=false)
         ),
         "CSC Hamiltonian construction" => @benchmarkable(
             Hamiltonian($basis, $terms; static_fmt=:csc)
+        ),
+        "constrained UserBasis CSC construction" => @benchmarkable(
+            Hamiltonian(
+                $constrained_user,
+                $constrained_terms;
+                static_fmt=:csc,
+                check_symm=false,
+                check_herm=false,
+                check_pcon=false,
+            )
+        ),
+        "nonbinary UserBasis CSC construction" => @benchmarkable(
+            Hamiltonian(
+                $nonbinary_user,
+                $nonbinary_terms;
+                static_fmt=:csc,
+                check_symm=false,
+                check_herm=false,
+                check_pcon=false,
+            )
         ),
         "CSC matrix-vector action" => @benchmarkable($H.data * $vector),
         "ARPACK lowest eigenpairs" => @benchmarkable(
