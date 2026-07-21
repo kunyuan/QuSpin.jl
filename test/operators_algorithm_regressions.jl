@@ -145,6 +145,7 @@ end
             rho,
             0.0,
             [time];
+            eom=:LvNE,
             max_step=0.2,
             rtol=1e-11,
             atol=1e-13,

@@ -9,6 +9,7 @@ using QuSpin
     @test isdefined(QuSpin, :Tools)
     @test QuSpin.Basis.SpinBasis1D === SpinBasis1D
     @test QuSpin.Operators.Hamiltonian === Hamiltonian
+    @test isempty(detect_ambiguities(QuSpin; recursive=true))
 end
 
 @testset "Wide basis integers" begin
@@ -26,6 +27,8 @@ end
     @test (UInt256(7) & UInt256(3)) == 3
     @test (UInt256(4) | UInt256(3)) == 7
     @test xor(UInt256(7), UInt256(3)) == 4
+    @test UInt256(7) == BigInt(7) == UInt256(7)
+    @test_throws ArgumentError UInt256(7) & UInt1024(3)
     @test (UInt256(3) << 4) == 48
     @test (UInt256(48) >> 4) == 3
     @test_throws ArgumentError python_int_to_basis_int(-1)
@@ -470,7 +473,8 @@ end
     spin_operator = zeros(ComplexF64, basis.Ns, basis.Ns)
     @test inplace_op!(spin_operator, basis, "z", [(1.0, 1)]) === spin_operator
     @test spin_operator == operator_matrix(basis, "z", [(1.0, 1)])
-    @test SpinBasisGeneral === SpinBasis1D
+    @test SpinBasisGeneral !== SpinBasis1D
+    @test states(SpinBasisGeneral(4; Nup=2, pauli=false)) == states(basis)
     projector = projection_matrix(basis)
     @test size(projector) == (16, 6)
     @test projector' * projector == Matrix(I, 6, 6)
@@ -519,9 +523,12 @@ end
         count(digit -> digit & 2 == 2, row) == 1
         for row in eachrow(spinful.occupations)
     )
-    @test BosonBasisGeneral === BosonBasis1D
-    @test SpinlessFermionBasisGeneral === SpinlessFermionBasis1D
-    @test SpinfulFermionBasisGeneral === SpinfulFermionBasis1D
+    @test BosonBasisGeneral !== BosonBasis1D
+    @test SpinlessFermionBasisGeneral !== SpinlessFermionBasis1D
+    @test SpinfulFermionBasisGeneral !== SpinfulFermionBasis1D
+    @test states(BosonBasisGeneral(3; Nb=2)) == states(bosons)
+    @test states(SpinlessFermionBasisGeneral(4; Nf=2)) == states(fermions)
+    @test states(SpinfulFermionBasisGeneral(2; Nf=(1, 1))) == states(spinful)
 end
 
 @testset "Tensor and photon bases" begin
@@ -784,6 +791,49 @@ end
     end
 end
 
+@testset "QuantumOperator Python-compatible archive" begin
+    basis = SpinBasis1D(2)
+    dense_component = ComplexF64[
+        1 2im 0 0
+        -2im 3 0 0
+        0 0 4 0.5
+        0 0 0.5 5
+    ]
+    sparse_component = sparse(ComplexF64[
+        0 0.25 0 0
+        0.25 0 0 0
+        0 0 0 -0.75im
+        0 0 0.75im 0
+    ])
+    operator = QuantumOperator(
+        basis,
+        Dict(
+            "dense" => dense_component,
+            "sparse" => sparse_component,
+        );
+        matrix_formats=Dict("dense" => :dense, "sparse" => :csc),
+    )
+    mktempdir() do directory
+        archive = joinpath(directory, "python-compatible.zip")
+        @test save_zip(
+            archive,
+            operator;
+            save_basis=false,
+            format=:python,
+        ) == archive
+        restored = load_zip(archive)
+        @test restored.basis == basis
+        @test restored.components["dense"] == dense_component
+        @test restored.components["sparse"] isa SparseMatrixCSC
+        @test restored.components["sparse"] == sparse_component
+        @test_throws ArgumentError save_zip(
+            joinpath(directory, "unsafe-basis.zip"),
+            operator;
+            format=:python,
+        )
+    end
+end
+
 @testset "QuantumLinearOperator protocol" begin
     basis = SpinBasis1D(3; nup=1, pauli=false)
     terms = [
@@ -853,6 +903,7 @@ end
     @test operator.is_dense
     @test get_operators(operator, :x) == Matrix(Hamiltonian(basis, x_terms))
     @test toarray(operator; pars) == expected
+    @test (@inferred toarray(operator; pars)) == expected
     @test todense(operator; pars) == expected
     @test Matrix(tocsc(operator; pars)) == expected
     @test Matrix(tocsr(operator; pars)) == expected
@@ -898,3 +949,4 @@ include("completeness_gaps.jl")
 include("basis_algorithm_regressions.jl")
 include("operators_algorithm_regressions.jl")
 include("tools_algorithm_regressions.jl")
+include("semantic_parity_regressions.jl")

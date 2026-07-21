@@ -5,6 +5,7 @@ using LinearAlgebra
 using Serialization
 using SparseArrays
 import ..Basis
+import ..Basis: project_to
 using ..Basis:
     AbstractBasis,
     SpinBasis1D,
@@ -304,6 +305,20 @@ end
 _spin_term_is_diagonal(term::OperatorTerm) =
     all(operator -> operator in ('I', 'z'), term.op)
 
+function _convert_projected_sparse(
+    ::Type{T},
+    matrix::SparseMatrixCSC,
+) where {T<:Number}
+    if T <: Real
+        maximum(abs ∘ imag, nonzeros(matrix); init=0.0) <= 3e-12 ||
+            throw(ArgumentError(
+                "the projected operator requires a complex coefficient type",
+            ))
+        return SparseMatrixCSC{T,Int}(real.(matrix))
+    end
+    return SparseMatrixCSC{T,Int}(matrix)
+end
+
 function _assemble(
     basis::AbstractBasis,
     terms::AbstractVector{<:OperatorTerm},
@@ -311,21 +326,33 @@ function _assemble(
     format=:dense,
 ) where {T}
     if basis isa SpinBasis1D && Basis._has_symmetry(basis.symmetry)
-        parent = Basis._spin_parent_basis(basis)
-        parent_matrix = _assemble(parent, terms, T, :csc)
-        projected =
-            basis.symmetry.projector' *
-            parent_matrix *
-            basis.symmetry.projector
+        projected = spzeros(T, length(basis), length(basis))
+        for term in terms
+            projected += _convert_projected_sparse(
+                T,
+                operator_matrix(
+                    basis,
+                    term.op,
+                    term.couplings;
+                    sparse=true,
+                ),
+            )
+        end
         return _matrix_with_format(projected, T, format)
     elseif basis isa Basis.DiscreteBasis &&
            Basis._has_symmetry(basis.symmetry)
-        parent = Basis._discrete_parent_basis(basis)
-        parent_matrix = _assemble(parent, terms, T, :csc)
-        projected =
-            basis.symmetry.projector' *
-            parent_matrix *
-            basis.symmetry.projector
+        projected = spzeros(T, length(basis), length(basis))
+        for term in terms
+            projected += _convert_projected_sparse(
+                T,
+                operator_matrix(
+                    basis,
+                    term.op,
+                    term.couplings;
+                    sparse=true,
+                ),
+            )
+        end
         return _matrix_with_format(projected, T, format)
     elseif basis isa Basis.DiscreteBasis
         rows = Int[]
@@ -583,7 +610,10 @@ LinearAlgebra.mul!(
 ) = mul!(output, H.data, value, alpha, beta)
 function LinearAlgebra.ishermitian(H::Hamiltonian)
     if H.hermitian === nothing
-        H.hermitian = ishermitian(H.data)
+        H.hermitian = ishermitian(H.data) && all(
+            ishermitian(matrix)
+            for (matrix, _, _) in H.dynamic_terms
+        )
     end
     return H.hermitian::Bool
 end
@@ -647,6 +677,272 @@ function _transform_hamiltonian(H::Hamiltonian, transform, function_transform=id
         dynamic,
         transformed_hermitian,
     )
+end
+
+_matrix_format_or_dense(matrix) =
+    matrix isa NativeMatrix ? _storage_format(matrix) : :dense
+
+function _hamiltonian_from_components(
+    basis::AbstractBasis,
+    static::AbstractMatrix,
+    dynamic;
+    terms=OperatorTerm[],
+    hermitian=nothing,
+)
+    T = promote_type(
+        eltype(static),
+        (eltype(first(entry)) for entry in dynamic)...,
+    )
+    static_matrix = _matrix_with_format(
+        static,
+        T,
+        _matrix_format_or_dense(static),
+    )
+    dynamic_terms = Tuple{NativeMatrix{T},Any,Tuple}[
+        (
+            _matrix_with_format(
+                matrix,
+                T,
+                _matrix_format_or_dense(matrix),
+            ),
+            function_value,
+            Tuple(arguments),
+        )
+        for (matrix, function_value, arguments) in dynamic
+    ]
+    return Hamiltonian{T}(
+        basis,
+        OperatorTerm[terms...],
+        static_matrix,
+        dynamic_terms,
+        hermitian,
+    )
+end
+
+function _check_hamiltonian_compatibility(left::Hamiltonian, right::Hamiltonian)
+    size(left) == size(right) ||
+        throw(DimensionMismatch("Hamiltonians must have the same shape"))
+    return nothing
+end
+
+function _scale_hamiltonian(H::Hamiltonian, coefficient::Number)
+    static = coefficient * H.data
+    dynamic = [
+        (coefficient * matrix, function_value, arguments)
+        for (matrix, function_value, arguments) in H.dynamic_terms
+    ]
+    hermitian =
+        H.hermitian === true && isreal(coefficient) ? true : nothing
+    return _hamiltonian_from_components(
+        H.basis,
+        static,
+        dynamic;
+        terms=H.terms,
+        hermitian,
+    )
+end
+
+function Base.:+(left::Hamiltonian, right::Hamiltonian)
+    _check_hamiltonian_compatibility(left, right)
+    dynamic = Any[left.dynamic_terms...; right.dynamic_terms...]
+    hermitian =
+        left.hermitian === true && right.hermitian === true ? true : nothing
+    return _hamiltonian_from_components(
+        left.basis,
+        left.data + right.data,
+        dynamic;
+        hermitian,
+    )
+end
+
+function Base.:-(left::Hamiltonian, right::Hamiltonian)
+    _check_hamiltonian_compatibility(left, right)
+    dynamic = Any[left.dynamic_terms...]
+    append!(
+        dynamic,
+        [
+            (-matrix, function_value, arguments)
+            for (matrix, function_value, arguments) in right.dynamic_terms
+        ],
+    )
+    hermitian =
+        left.hermitian === true && right.hermitian === true ? true : nothing
+    return _hamiltonian_from_components(
+        left.basis,
+        left.data - right.data,
+        dynamic;
+        hermitian,
+    )
+end
+
+Base.:-(H::Hamiltonian) = _scale_hamiltonian(H, -1)
+Base.:*(coefficient::Number, H::Hamiltonian) =
+    _scale_hamiltonian(H, coefficient)
+Base.:*(H::Hamiltonian, coefficient::Number) =
+    _scale_hamiltonian(H, coefficient)
+Base.:/(H::Hamiltonian, coefficient::Number) =
+    _scale_hamiltonian(H, inv(coefficient))
+
+function _dynamic_product_value(
+    time,
+    left_function,
+    left_arguments,
+    right_function,
+    right_arguments,
+)
+    return left_function(time, left_arguments...) *
+        right_function(time, right_arguments...)
+end
+
+function _hamiltonian_product(left::Hamiltonian, right::Hamiltonian)
+    _check_hamiltonian_compatibility(left, right)
+    dynamic = Any[]
+    for (matrix, function_value, arguments) in left.dynamic_terms
+        push!(
+            dynamic,
+            (matrix * right.data, function_value, arguments),
+        )
+    end
+    for (matrix, function_value, arguments) in right.dynamic_terms
+        push!(
+            dynamic,
+            (left.data * matrix, function_value, arguments),
+        )
+    end
+    for (
+        left_matrix,
+        left_function,
+        left_arguments,
+    ) in left.dynamic_terms, (
+        right_matrix,
+        right_function,
+        right_arguments,
+    ) in right.dynamic_terms
+        push!(
+            dynamic,
+            (
+                left_matrix * right_matrix,
+                _dynamic_product_value,
+                (
+                    left_function,
+                    left_arguments,
+                    right_function,
+                    right_arguments,
+                ),
+            ),
+        )
+    end
+    return _hamiltonian_from_components(
+        left.basis,
+        left.data * right.data,
+        dynamic,
+    )
+end
+
+Base.:*(left::Hamiltonian, right::Hamiltonian) =
+    _hamiltonian_product(left, right)
+
+function _check_hamiltonian_matrix(H::Hamiltonian, matrix::AbstractMatrix)
+    size(matrix) == size(H) ||
+        throw(DimensionMismatch(
+            "matrix and Hamiltonian must have the same square shape",
+        ))
+    return nothing
+end
+
+function Base.:+(H::Hamiltonian, matrix::AbstractMatrix)
+    _check_hamiltonian_matrix(H, matrix)
+    return _hamiltonian_from_components(
+        H.basis,
+        H.data + matrix,
+        H.dynamic_terms,
+    )
+end
+
+Base.:+(matrix::AbstractMatrix, H::Hamiltonian) = H + matrix
+
+function Base.:-(H::Hamiltonian, matrix::AbstractMatrix)
+    _check_hamiltonian_matrix(H, matrix)
+    return _hamiltonian_from_components(
+        H.basis,
+        H.data - matrix,
+        H.dynamic_terms,
+    )
+end
+
+function Base.:-(matrix::AbstractMatrix, H::Hamiltonian)
+    _check_hamiltonian_matrix(H, matrix)
+    return _hamiltonian_from_components(
+        H.basis,
+        matrix - H.data,
+        [
+            (-dynamic_matrix, function_value, arguments)
+            for (
+                dynamic_matrix,
+                function_value,
+                arguments,
+            ) in H.dynamic_terms
+        ],
+    )
+end
+
+function Base.:*(H::Hamiltonian, matrix::AbstractMatrix)
+    size(matrix) == size(H) || return H.data * matrix
+    return _hamiltonian_from_components(
+        H.basis,
+        H.data * matrix,
+        [
+            (dynamic_matrix * matrix, function_value, arguments)
+            for (
+                dynamic_matrix,
+                function_value,
+                arguments,
+            ) in H.dynamic_terms
+        ],
+    )
+end
+
+function Base.:*(matrix::AbstractMatrix, H::Hamiltonian)
+    size(matrix) == size(H) || return matrix * H.data
+    return _hamiltonian_from_components(
+        H.basis,
+        matrix * H.data,
+        [
+            (matrix * dynamic_matrix, function_value, arguments)
+            for (
+                dynamic_matrix,
+                function_value,
+                arguments,
+            ) in H.dynamic_terms
+        ],
+    )
+end
+
+function Base.:^(H::Hamiltonian, power::Integer)
+    power >= 0 ||
+        throw(ArgumentError("Hamiltonian power must be nonnegative"))
+    if iszero(power)
+        identity_matrix = spdiagm(
+            0 => ones(eltype(H), size(H, 1)),
+        )
+        return _hamiltonian_from_components(
+            H.basis,
+            identity_matrix,
+            Any[];
+            hermitian=true,
+        )
+    end
+    result = nothing
+    factor = H
+    exponent = power
+    while exponent > 0
+        if isodd(exponent)
+            result = result === nothing ? factor : result * factor
+        end
+        exponent >>= 1
+        exponent > 0 && (factor = factor * factor)
+    end
+    return result
 end
 
 Base.copy(H::Hamiltonian) = _transform_hamiltonian(H, copy)
@@ -1433,11 +1729,13 @@ function _krylov_expmv(
     return result
 end
 
-function _evolution_derivative(H, value, time, imag_time)
+function _evolution_derivative(H, value, time, imag_time, eom)
     left = apply(H, value; time)
-    if value isa AbstractVector
+    if eom === :SE
         return (imag_time ? -one(eltype(left)) : -im) .* left
     end
+    value isa AbstractMatrix && size(value, 1) == size(value, 2) ||
+        throw(DimensionMismatch("LvNE evolution requires a square density matrix"))
     right = right_apply(H, value; time)
     return imag_time ?
         -(left + right) / 2 :
@@ -1452,6 +1750,7 @@ function _rk45_interval(
     initial_step::Real,
     max_step::Real,
     imag_time::Bool;
+    eom=:SE,
     rtol::Real=1e-9,
     atol::Real=1e-11,
 )
@@ -1459,21 +1758,28 @@ function _rk45_interval(
     time = float(start)
     step = min(max_step, max(initial_step, eps(float(target + one(target)))))
     while time < target
-        step = min(step, target - time)
+        remaining = target - time
+        if remaining <= 8eps(max(abs(time), abs(target), 1.0))
+            time = float(target)
+            break
+        end
+        step = min(step, remaining)
         step > eps(max(abs(time), 1.0)) ||
             throw(ErrorException("adaptive evolution step underflow"))
-        k1 = _evolution_derivative(H, state, time, imag_time)
+        k1 = _evolution_derivative(H, state, time, imag_time, eom)
         k2 = _evolution_derivative(
             H,
             state + step * (1 / 5) * k1,
             time + step * (1 / 5),
             imag_time,
+            eom,
         )
         k3 = _evolution_derivative(
             H,
             state + step * ((3 / 40) * k1 + (9 / 40) * k2),
             time + step * (3 / 10),
             imag_time,
+            eom,
         )
         k4 = _evolution_derivative(
             H,
@@ -1482,6 +1788,7 @@ function _rk45_interval(
             ((44 / 45) * k1 - (56 / 15) * k2 + (32 / 9) * k3),
             time + step * (4 / 5),
             imag_time,
+            eom,
         )
         k5 = _evolution_derivative(
             H,
@@ -1495,6 +1802,7 @@ function _rk45_interval(
             ),
             time + step * (8 / 9),
             imag_time,
+            eom,
         )
         k6 = _evolution_derivative(
             H,
@@ -1509,6 +1817,7 @@ function _rk45_interval(
             ),
             time + step,
             imag_time,
+            eom,
         )
         fifth = state +
             step *
@@ -1519,7 +1828,7 @@ function _rk45_interval(
                 (2187 / 6784) * k5 +
                 (11 / 84) * k6
             )
-        k7 = _evolution_derivative(H, fifth, time + step, imag_time)
+        k7 = _evolution_derivative(H, fifth, time + step, imag_time, eom)
         fourth = state +
             step *
             (
@@ -1553,6 +1862,14 @@ function evolve(
     max_step::Real=0.01,
     kwargs...,
 )
+    scalar_target = times isa Number
+    targets = scalar_target ? [times] : collect(times)
+    normalized_eom = Symbol(eom)
+    normalized_eom in (:SE, :LvNE) ||
+        throw(ArgumentError("eom must be :SE or :LvNE"))
+    normalized_eom === :LvNE &&
+        (!(v0 isa AbstractMatrix) || size(v0, 1) != size(v0, 2)) &&
+        throw(DimensionMismatch("LvNE evolution requires a square density matrix"))
     if !isempty(H.dynamic_terms)
         max_step > 0 || throw(ArgumentError("max_step must be positive"))
         state = ComplexF64.(v0)
@@ -1561,7 +1878,7 @@ function evolve(
         next_step = max_step
         rtol = get(kwargs, :rtol, get(kwargs, :tol, 1e-9))
         atol = get(kwargs, :atol, 1e-11)
-        for target in times
+        for target in targets
             target >= current ||
                 throw(ArgumentError("times must be sorted and not precede t0"))
             state, next_step = _rk45_interval(
@@ -1572,40 +1889,68 @@ function evolve(
                 next_step,
                 max_step,
                 imag_time;
+                eom=normalized_eom,
                 rtol,
                 atol,
             )
             current = float(target)
             if imag_time
-                state = state isa AbstractVector ?
-                    state / norm(state) :
-                    state / tr(state)
+                state = normalized_eom === :LvNE ?
+                    state / tr(state) :
+                    state ./ sqrt.(sum(abs2, state; dims=1))
             end
             push!(states, copy(state))
         end
         iterate && return (state for state in states)
+        scalar_target && return first(states)
         return v0 isa AbstractVector ?
             reduce(hcat, states) :
             cat(states...; dims=3)
     end
 
-    offsets = collect(times) .- t0
-    if v0 isa AbstractVector
+    offsets = targets .- t0
+    if normalized_eom === :SE
         scales = imag_time ? -offsets : -im .* offsets
-        states = _krylov_expmv_times(
-            H.data,
-            v0,
-            scales;
-            tol=get(kwargs, :tol, 1e-12),
-            krylov_dim=get(kwargs, :krylov_dim, 30),
+        if v0 isa AbstractVector
+            states = _krylov_expmv_times(
+                H.data,
+                v0,
+                scales;
+                tol=get(kwargs, :tol, 1e-12),
+                krylov_dim=get(kwargs, :krylov_dim, 30),
+            )
+            if imag_time
+                for state in eachcol(states)
+                    rmul!(state, inv(norm(state)))
+                end
+            end
+            iterate && return (copy(state) for state in eachcol(states))
+            scalar_target && return copy(@view(states[:, 1]))
+            return states
+        end
+        batch_states = cat(
+            (
+                _krylov_expmv(
+                    H.data,
+                    v0,
+                    scale;
+                    tol=get(kwargs, :tol, 1e-12),
+                    krylov_dim=get(kwargs, :krylov_dim, 30),
+                )
+                for scale in scales
+            )...;
+            dims=3,
         )
         if imag_time
-            for state in eachcol(states)
+            for index in axes(batch_states, 3), column in axes(batch_states, 2)
+                state = @view batch_states[:, column, index]
                 rmul!(state, inv(norm(state)))
             end
         end
-        iterate && return (copy(state) for state in eachcol(states))
-        return states
+        iterate &&
+            return (copy(@view(batch_states[:, :, index])) for index in axes(batch_states, 3))
+        scalar_target && return copy(@view(batch_states[:, :, 1]))
+        return batch_states
     end
     size(v0, 1) == size(v0, 2) == size(H, 1) ||
         throw(DimensionMismatch("density matrix must match Hamiltonian"))
@@ -1629,6 +1974,7 @@ function evolve(
         for time in offsets
     ]
     iterate && return (state for state in states)
+    scalar_target && return first(states)
     return cat(states...; dims=3)
 end
 
@@ -1680,17 +2026,32 @@ function matrix_ele(
 end
 
 function project_to(H::Hamiltonian, projector)
-    P = projector isa AbstractMatrix ? projector : Matrix(projector)
-    projected = if size(H, 1) == size(P, 1)
-        P' * H.data * P
+    P = projector isa AbstractBasis ?
+        Basis.projection_matrix(projector) :
+        projector isa AbstractMatrix ? projector : Matrix(projector)
+    transform = if size(H, 1) == size(P, 1)
+        matrix -> P' * matrix * P
     elseif size(H, 1) == size(P, 2)
-        P * H.data * P'
+        matrix -> P * matrix * P'
     else
         throw(DimensionMismatch("Hamiltonian and projector dimensions do not match"))
     end
-    size(projected) == size(H.data) ||
-        return projected
-    return _hamiltonian_from_data(H.basis, projected)
+    projected = transform(H.data)
+    target_basis = projector isa AbstractBasis ? projector : H.basis
+    if size(projected) != size(H.data) && !(projector isa AbstractBasis)
+        isempty(H.dynamic_terms) && return projected
+        throw(ArgumentError(
+            "a dimension-changing dynamic projection requires the target basis",
+        ))
+    end
+    return _hamiltonian_from_components(
+        target_basis,
+        projected,
+        [
+            (transform(matrix), function_value, arguments)
+            for (matrix, function_value, arguments) in H.dynamic_terms
+        ],
+    )
 end
 
 function quant_fluct(H::Hamiltonian, state; time=0, enforce_pure::Bool=false, kwargs...)
@@ -1718,7 +2079,15 @@ function rotate_by(H::Hamiltonian, other; generator::Bool=false, kwargs...)
     U = generator ?
         get_mat(ExpOp(_operator_dense_or_self(other); kwargs...)) :
         other isa ExpOp ? get_mat(other) : _operator_dense_or_self(other)
-    return _hamiltonian_from_data(H.basis, U' * H.data * U)
+    transform = matrix -> U' * matrix * U
+    return _hamiltonian_from_components(
+        H.basis,
+        transform(H.data),
+        [
+            (transform(matrix), function_value, arguments)
+            for (matrix, function_value, arguments) in H.dynamic_terms
+        ],
+    )
 end
 
 LinearAlgebra.tr(H::Hamiltonian) = tr(H.data)
@@ -2855,17 +3224,148 @@ mutable struct QuantumOperator{T<:Number}
 end
 
 """
-    save_zip(archive, operator; save_basis=true)
+    save_zip(archive, operator; save_basis=true, format=:native)
 
-Persist a `QuantumOperator` in QuSpin.jl's versioned native archive format.
-The function retains the historical name while deliberately avoiding a Python
-pickle dependency.
+Persist a `QuantumOperator`. The default `format=:native` uses QuSpin.jl's
+versioned serialization and can retain the basis. `format=:python` writes the
+dense/CSC NPZ layout consumed by Python QuSpin and requires
+`save_basis=false`, because Julia cannot safely emit Python `basis.pickle`
+objects.
 """
+const _NPZ_PACKAGE_ID = Base.PkgId(
+    Base.UUID("15e1cf62-19b3-5cfa-8e77-841668bca605"),
+    "NPZ",
+)
+const _ZIPFILE_PACKAGE_ID = Base.PkgId(
+    Base.UUID("a5390f91-8eb1-5f08-bee0-b1d1ffed6cea"),
+    "ZipFile",
+)
+
+_npz_module() = Base.require(_NPZ_PACKAGE_ID)
+_zipfile_module() = Base.require(_ZIPFILE_PACKAGE_ID)
+
+function _write_npy_string(io, value::AbstractString)
+    bytes = collect(codeunits(value))
+    length(bytes) <= 255 ||
+        throw(ArgumentError("NPY byte strings must fit in 255 bytes"))
+    write(io, UInt8[0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59])
+    write(io, UInt8[0x01, 0x00])
+    header =
+        "{'descr': '|S$(length(bytes))', 'fortran_order': False, 'shape': (), }"
+    total_without_padding = 10 + ncodeunits(header)
+    padding = mod(-total_without_padding, 16)
+    padding == 0 && (padding = 16)
+    header *= repeat(" ", padding - 1) * "\n"
+    header_length = UInt16(ncodeunits(header))
+    write(io, UInt8(header_length & 0xff))
+    write(io, UInt8(header_length >> 8))
+    write(io, header)
+    write(io, bytes)
+    return io
+end
+
+function _npz_bytes(
+    arrays::AbstractDict{<:AbstractString};
+    format_string=nothing,
+)
+    npz = _npz_module()
+    zipfile = _zipfile_module()
+    buffer = IOBuffer()
+    archive = zipfile.Writer(buffer)
+    for (name, value) in arrays
+        file = zipfile.addfile(
+            archive,
+            String(name) * ".npy";
+            method=zipfile.Deflate,
+        )
+        npz.npzwritearray(file, value)
+        close(file)
+    end
+    if format_string !== nothing
+        file = zipfile.addfile(
+            archive,
+            "format.npy";
+            method=zipfile.Deflate,
+        )
+        _write_npy_string(file, String(format_string))
+        close(file)
+    end
+    close(archive)
+    return take!(buffer)
+end
+
+function _python_archive_component(matrix)
+    if matrix isa AbstractSparseMatrix ||
+       matrix isa Union{SparseMatrixCSR,DIAMatrix}
+        csc = SparseMatrixCSC(sparse(matrix))
+        arrays = Dict{String,Any}(
+            "data" => copy(nonzeros(csc)),
+            "indices" => Int64.(rowvals(csc) .- 1),
+            "indptr" => Int64.(csc.colptr .- 1),
+            "shape" => Int64[size(csc, 1), size(csc, 2)],
+        )
+        return "sparse_", _npz_bytes(arrays; format_string="csc")
+    end
+    return "dense_", _npz_bytes(Dict("matrix" => Matrix(matrix)))
+end
+
+function _save_python_zip(
+    archive_path::AbstractString,
+    operator::QuantumOperator,
+)
+    zipfile = _zipfile_module()
+    archive = zipfile.Writer(archive_path)
+    seen = Set{String}()
+    try
+        for (key, matrix) in operator.components
+            key_string = string(key)
+            (
+                isempty(key_string) ||
+                occursin('/', key_string) ||
+                occursin('\\', key_string)
+            ) &&
+                throw(ArgumentError(
+                    "Python archive keys must be nonempty filename-safe strings",
+                ))
+            prefix, payload = _python_archive_component(matrix)
+            filename = prefix * key_string * ".npz"
+            filename in seen &&
+                throw(ArgumentError(
+                    "duplicate Python archive key '$key_string'",
+                ))
+            push!(seen, filename)
+            file = zipfile.addfile(archive, filename)
+            write(file, payload)
+            close(file)
+        end
+    finally
+        close(archive)
+    end
+    return archive_path
+end
+
 function save_zip(
     archive::AbstractString,
     operator::QuantumOperator;
     save_basis::Bool=true,
+    format=:native,
 )
+    normalized_format = Symbol(lowercase(String(format)))
+    normalized_format in (:native, :python) ||
+        throw(ArgumentError("format must be :native or :python"))
+    if normalized_format === :python
+        save_basis &&
+            throw(ArgumentError(
+                "Python-compatible archives cannot safely encode Python basis.pickle objects; use save_basis=false",
+            ))
+        _npz_module()
+        _zipfile_module()
+        return Base.invokelatest(
+            _save_python_zip,
+            archive,
+            operator,
+        )
+    end
     payload = Dict(
         "format" => "QuSpin.jl-quantum-operator-v1",
         "basis" => save_basis ? operator.basis : nothing,
@@ -2880,12 +3380,144 @@ end
 save_zip(archive::AbstractString, operator::QuantumOperator, save_basis::Bool) =
     save_zip(archive, operator; save_basis)
 
+struct _ArchiveBasis <: AbstractBasis
+    dimension::Int
+end
+Base.length(basis::_ArchiveBasis) = basis.dimension
+
+function _read_npy_string(file)
+    bytes = read(file)
+    length(bytes) >= 10 ||
+        throw(ArgumentError("invalid NPY string payload"))
+    bytes[1:6] == UInt8[0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59] ||
+        throw(ArgumentError("invalid NPY magic"))
+    major = bytes[7]
+    header_length, data_start = if major == 1
+        Int(bytes[9]) | (Int(bytes[10]) << 8), 11
+    else
+        length(bytes) >= 12 ||
+            throw(ArgumentError("invalid NPY v2 header"))
+        (
+            Int(bytes[9]) |
+            (Int(bytes[10]) << 8) |
+            (Int(bytes[11]) << 16) |
+            (Int(bytes[12]) << 24),
+            13,
+        )
+    end
+    payload_start = data_start + header_length
+    payload_start <= length(bytes) + 1 ||
+        throw(ArgumentError("truncated NPY string payload"))
+    return String(bytes[payload_start:end])
+end
+
+function _read_inner_npz(payload)
+    npz = _npz_module()
+    zipfile = _zipfile_module()
+    reader = zipfile.Reader(IOBuffer(payload))
+    arrays = Dict{String,Any}()
+    sparse_format = nothing
+    try
+        for file in reader.files
+            name = replace(file.name, r"\.npy$" => "")
+            if name == "format"
+                sparse_format = _read_npy_string(file)
+            else
+                arrays[name] = npz.npzreadarray(file)
+            end
+        end
+    finally
+        close(reader)
+    end
+    return arrays, sparse_format
+end
+
+function _sparse_from_python_npz(arrays, sparse_format)
+    shape = Int.(vec(arrays["shape"]))
+    length(shape) == 2 ||
+        throw(ArgumentError("sparse NPZ shape must have two dimensions"))
+    m, n = shape
+    data = vec(arrays["data"])
+    indices = Int.(vec(arrays["indices"])) .+ 1
+    indptr = Int.(vec(arrays["indptr"])) .+ 1
+    if sparse_format == "csc"
+        return SparseMatrixCSC(m, n, indptr, indices, data)
+    elseif sparse_format == "csr"
+        rows = Int[]
+        columns = Int[]
+        values = eltype(data)[]
+        for row in 1:m
+            for pointer in indptr[row]:(indptr[row + 1] - 1)
+                push!(rows, row)
+                push!(columns, indices[pointer])
+                push!(values, data[pointer])
+            end
+        end
+        return sparse(rows, columns, values, m, n)
+    end
+    throw(ArgumentError(
+        "unsupported Python sparse archive format '$sparse_format'",
+    ))
+end
+
+function _load_python_zip(archive_path::AbstractString)
+    zipfile = _zipfile_module()
+    archive = zipfile.Reader(archive_path)
+    components = Dict{Any,Any}()
+    saw_pickled_basis = false
+    try
+        for file in archive.files
+            if file.name == "basis.pickle"
+                saw_pickled_basis = true
+                continue
+            end
+            dense_match = match(r"^dense_(.*)\.npz$", file.name)
+            sparse_match = match(r"^sparse_(.*)\.npz$", file.name)
+            (dense_match === nothing) == (sparse_match === nothing) &&
+                throw(ArgumentError(
+                    "unsupported entry '$(file.name)' in Python QuSpin archive",
+                ))
+            payload = read(file)
+            arrays, sparse_format = _read_inner_npz(payload)
+            if dense_match !== nothing
+                haskey(arrays, "matrix") ||
+                    throw(ArgumentError("dense NPZ entry lacks matrix data"))
+                components[dense_match.captures[1]] = arrays["matrix"]
+            else
+                components[sparse_match.captures[1]] =
+                    _sparse_from_python_npz(arrays, sparse_format)
+            end
+        end
+    finally
+        close(archive)
+    end
+    isempty(components) &&
+        throw(ArgumentError("Python QuSpin archive contains no operators"))
+    dimension = size(first(values(components)), 1)
+    basis = if saw_pickled_basis
+        _ArchiveBasis(dimension)
+    elseif ispow2(dimension)
+        SpinBasis1D(trailing_zeros(dimension))
+    else
+        _ArchiveBasis(dimension)
+    end
+    return QuantumOperator(basis, components)
+end
+
 """
     load_zip(archive)
 
 Load an archive written by `save_zip`.
 """
 function load_zip(archive::AbstractString)
+    magic = open(archive, "r") do io
+        read(io, min(4, filesize(archive)))
+    end
+    if magic[1:min(2, length(magic))] == UInt8[0x50, 0x4b]
+        _npz_module()
+        _zipfile_module()
+        return Base.invokelatest(_load_python_zip, archive)
+    end
     payload = open(deserialize, archive)
     payload isa AbstractDict &&
         get(payload, "format", nothing) == "QuSpin.jl-quantum-operator-v1" ||
@@ -2944,16 +3576,32 @@ function QuantumOperator(
     return QuantumOperator{T}(basis, components)
 end
 
-function _parameter_matrix(operator::QuantumOperator, pars::AbstractDict=Dict())
-    T = promote_type(
-        eltype(first(values(operator.components))),
-        (typeof(value) for value in values(pars))...,
-    )
+function _check_quantum_parameters(
+    operator::QuantumOperator,
+    pars::AbstractDict,
+)
+    extra = setdiff(keys(pars), keys(operator.components))
+    isempty(extra) ||
+        throw(ArgumentError("unexpected operator parameters: $(collect(extra))"))
+    return nothing
+end
+
+@inline _parameter_eltype(
+    ::QuantumOperator{T},
+    ::AbstractDict{K,V},
+) where {T,K,V} = promote_type(T, V)
+
+function _parameter_matrix(
+    operator::QuantumOperator,
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
+)
+    _check_quantum_parameters(operator, pars)
+    T = _parameter_eltype(operator, pars)
     result = all(value isa SparseMatrixCSC for value in values(operator.components)) ?
         spzeros(T, size(operator)...) :
         zeros(T, size(operator)...)
     for (key, matrix) in operator.components
-        result = result + get(pars, key, zero(T)) * matrix
+        result = result + get(pars, key, one(T)) * matrix
     end
     return result
 end
@@ -3006,6 +3654,71 @@ Base.adjoint(operator::QuantumOperator) = _quantum_operator_from_components(
 )
 isquantum_operator(value) = value isa QuantumOperator
 
+function _combine_quantum_operators(
+    left::QuantumOperator,
+    right::QuantumOperator,
+    right_scale::Number,
+)
+    size(left) == size(right) ||
+        throw(DimensionMismatch("QuantumOperators must have the same shape"))
+    keys_union = union(keys(left.components), keys(right.components))
+    raw = Dict{Any,Any}()
+    for key in keys_union
+        left_matrix = get(left.components, key, nothing)
+        right_matrix = get(right.components, key, nothing)
+        raw[key] = left_matrix === nothing ?
+            right_scale * right_matrix :
+            right_matrix === nothing ?
+                copy(left_matrix) :
+                left_matrix + right_scale * right_matrix
+    end
+    T = promote_type((eltype(matrix) for matrix in values(raw))...)
+    components = Dict{Any,NativeMatrix{T}}()
+    for (key, matrix) in raw
+        format = _matrix_format_or_dense(matrix)
+        components[key] = _matrix_with_format(matrix, T, format)
+    end
+    return QuantumOperator{T}(left.basis, components)
+end
+
+Base.:+(left::QuantumOperator, right::QuantumOperator) =
+    _combine_quantum_operators(left, right, 1)
+Base.:-(left::QuantumOperator, right::QuantumOperator) =
+    _combine_quantum_operators(left, right, -1)
+Base.:-(operator::QuantumOperator) = (-1) * operator
+
+function _scale_quantum_operator(
+    operator::QuantumOperator,
+    coefficient::Number,
+)
+    T = promote_type(eltype(operator), typeof(coefficient))
+    return QuantumOperator{T}(
+        operator.basis,
+        Dict{Any,NativeMatrix{T}}(
+            key => _matrix_with_format(
+                coefficient * matrix,
+                T,
+                _matrix_format_or_dense(matrix),
+            )
+            for (key, matrix) in operator.components
+        ),
+    )
+end
+
+Base.:*(coefficient::Number, operator::QuantumOperator) =
+    _scale_quantum_operator(operator, coefficient)
+Base.:*(operator::QuantumOperator, coefficient::Number) =
+    _scale_quantum_operator(operator, coefficient)
+Base.:/(operator::QuantumOperator, coefficient::Number) =
+    _scale_quantum_operator(operator, inv(coefficient))
+Base.:+(operator::QuantumOperator, value::Number) =
+    iszero(value) ? operator :
+    throw(ArgumentError("only zero can be added to a QuantumOperator"))
+Base.:+(value::Number, operator::QuantumOperator) = operator + value
+Base.:-(operator::QuantumOperator, value::Number) =
+    iszero(value) ? operator :
+    throw(ArgumentError("only zero can be subtracted from a QuantumOperator"))
+
 get_operators(operator::QuantumOperator, key) = copy(operator.components[key])
 
 function astype(
@@ -3023,37 +3736,46 @@ function astype(
     )
 end
 
-toarray(operator::QuantumOperator; pars::AbstractDict=Dict(), out=nothing) =
+toarray(
+    operator::QuantumOperator;
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
+    out=nothing,
+) =
     _copy_or_write(Matrix(_parameter_matrix(operator, pars)), out)
 todense(operator::QuantumOperator; kwargs...) = toarray(operator; kwargs...)
-tocsc(operator::QuantumOperator; pars::AbstractDict=Dict()) =
+tocsc(
+    operator::QuantumOperator;
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
+) =
     sparse(_parameter_matrix(operator, pars))
-function tocsr(operator::QuantumOperator; pars::AbstractDict=Dict())
+function tocsr(
+    operator::QuantumOperator;
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
+)
     return SparseMatrixCSR(_parameter_matrix(operator, pars))
 end
-function diagonal(operator::QuantumOperator; pars::AbstractDict=Dict())
-    T = promote_type(
-        eltype(operator),
-        (typeof(value) for value in values(pars))...,
-    )
+function diagonal(
+    operator::QuantumOperator;
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
+)
+    _check_quantum_parameters(operator, pars)
+    T = _parameter_eltype(operator, pars)
     result = zeros(T, size(operator, 1))
     for (key, matrix) in operator.components
-        coefficient = get(pars, key, zero(T))
+        coefficient = get(pars, key, one(T))
         iszero(coefficient) || (result .+= coefficient .* diag(matrix))
     end
     return result
 end
 function LinearAlgebra.tr(
     operator::QuantumOperator;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
 )
-    T = promote_type(
-        eltype(operator),
-        (typeof(value) for value in values(pars))...,
-    )
+    _check_quantum_parameters(operator, pars)
+    T = _parameter_eltype(operator, pars)
     result = zero(T)
     for (key, matrix) in operator.components
-        coefficient = get(pars, key, zero(T))
+        coefficient = get(pars, key, one(T))
         iszero(coefficient) || (result += coefficient * tr(matrix))
     end
     return result
@@ -3062,19 +3784,19 @@ end
 function apply(
     operator::QuantumOperator,
     value::AbstractVecOrMat;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
     out=nothing,
     overwrite_out::Bool=true,
     a::Number=1,
     kwargs...,
 )
+    _check_quantum_parameters(operator, pars)
     size(value, 1) == size(operator, 2) ||
         throw(DimensionMismatch("operator and value dimensions do not match"))
     T = promote_type(
-        eltype(operator),
+        _parameter_eltype(operator, pars),
         eltype(value),
         typeof(a),
-        (typeof(coefficient) for coefficient in values(pars))...,
     )
     result = out === nothing ?
         _action_output(T, size(operator, 1), value) :
@@ -3092,7 +3814,7 @@ function apply(
         fill!(result, zero(eltype(result)))
     end
     for (key, matrix) in operator.components
-        coefficient = get(pars, key, zero(T))
+        coefficient = get(pars, key, one(T))
         iszero(coefficient) && continue
         _matrix_mul_add!(result, matrix, input, a * coefficient, true)
     end
@@ -3102,17 +3824,17 @@ end
 function right_apply(
     operator::QuantumOperator,
     value;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
     out=nothing,
     overwrite_out::Bool=true,
     a::Number=1,
     kwargs...,
 )
+    _check_quantum_parameters(operator, pars)
     T = promote_type(
-        eltype(operator),
+        _parameter_eltype(operator, pars),
         eltype(value),
         typeof(a),
-        (typeof(coefficient) for coefficient in values(pars))...,
     )
     result = out === nothing ? similar(value, T) : out
     if value isa StridedVector{<:LinearAlgebra.BlasFloat} &&
@@ -3126,7 +3848,7 @@ function right_apply(
         @inbounds for destination in eachindex(result)
             fill!(column, zero(T))
             for (key, matrix) in operator.components
-                coefficient = get(pars, key, zero(T))
+                coefficient = get(pars, key, one(T))
                 iszero(coefficient) && continue
                 for source in eachindex(column)
                     column[source] +=
@@ -3153,7 +3875,7 @@ function right_apply(
         nothing
     input = Base.mightalias(result, value) ? copy(value) : value
     for (key, matrix) in operator.components
-        coefficient = get(pars, key, zero(T))
+        coefficient = get(pars, key, one(T))
         iszero(coefficient) && continue
         _right_matrix_mul_add!(
             result,
@@ -3166,7 +3888,11 @@ function right_apply(
     return result
 end
 
-function eigh(operator::QuantumOperator; pars::AbstractDict=Dict(), kwargs...)
+function eigh(
+    operator::QuantumOperator;
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
+    kwargs...,
+)
     matrix = Matrix(_parameter_matrix(operator, pars))
     decomposition = ishermitian(matrix) ?
         eigen(Hermitian(matrix)) :
@@ -3176,7 +3902,7 @@ end
 
 function LinearAlgebra.eigvals(
     operator::QuantumOperator;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
 )
     values, _ = eigh(operator; pars)
     return values
@@ -3184,7 +3910,7 @@ end
 
 function eigsh(
     operator::QuantumOperator;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
     k::Integer=min(6, size(operator, 1)),
     which=:SA,
     kwargs...,
@@ -3198,7 +3924,7 @@ end
 
 function tohamiltonian(
     operator::QuantumOperator;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
     copy::Bool=true,
 )
     return _hamiltonian_from_data(
@@ -3209,12 +3935,10 @@ end
 
 function aslinearoperator(
     operator::QuantumOperator;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
 )
-    T = promote_type(
-        eltype(operator),
-        (typeof(value) for value in values(pars))...,
-    )
+    _check_quantum_parameters(operator, pars)
+    T = _parameter_eltype(operator, pars)
     action! = (output, input) ->
         apply(
             operator,
@@ -3224,9 +3948,9 @@ function aslinearoperator(
             overwrite_out=true,
         )
     hermitian = all(
-        iszero(get(pars, key, zero(T))) ||
+        iszero(get(pars, key, one(T))) ||
         (
-            isreal(get(pars, key, zero(T))) &&
+            isreal(get(pars, key, one(T))) &&
             ishermitian(matrix)
         )
         for (key, matrix) in operator.components
@@ -3241,10 +3965,11 @@ end
 function expt_value(
     operator::QuantumOperator,
     state;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
     enforce_pure::Bool=false,
     kwargs...,
 )
+    _check_quantum_parameters(operator, pars)
     if state isa AbstractVector
         return dot(state, apply(operator, state; pars))
     elseif enforce_pure || (ndims(state) == 2 && size(state, 2) != size(operator, 1))
@@ -3265,13 +3990,12 @@ function expt_value(
         ]
     end
     T = promote_type(
-        eltype(operator),
+        _parameter_eltype(operator, pars),
         eltype(state),
-        (typeof(value) for value in values(pars))...,
     )
     result = zero(T)
     for (key, matrix) in operator.components
-        coefficient = get(pars, key, zero(T))
+        coefficient = get(pars, key, one(T))
         iszero(coefficient) ||
             (result += coefficient * _trace_product(state, matrix))
     end
@@ -3282,7 +4006,7 @@ function matrix_ele(
     operator::QuantumOperator,
     left,
     right;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
     diagonal::Bool=false,
     kwargs...,
 )
@@ -3293,7 +4017,7 @@ end
 function quant_fluct(
     operator::QuantumOperator,
     state;
-    pars::AbstractDict=Dict(),
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
     enforce_pure::Bool=false,
     kwargs...,
 )
@@ -3340,6 +4064,10 @@ _operator_matrix(operator::AbstractMatrix) = operator
 
 """Return the matrix commutator `A * B - B * A`."""
 function commutator(left, right)
+    if left isa Hamiltonian && right isa Hamiltonian &&
+        (!isempty(left.dynamic_terms) || !isempty(right.dynamic_terms))
+        return left * right - right * left
+    end
     A = _operator_matrix(left)
     B = _operator_matrix(right)
     size(A, 2) == size(B, 1) && size(B, 2) == size(A, 1) ||
@@ -3349,6 +4077,10 @@ end
 
 """Return the matrix anticommutator `A * B + B * A`."""
 function anti_commutator(left, right)
+    if left isa Hamiltonian && right isa Hamiltonian &&
+        (!isempty(left.dynamic_terms) || !isempty(right.dynamic_terms))
+        return left * right + right * left
+    end
     A = _operator_matrix(left)
     B = _operator_matrix(right)
     size(A, 2) == size(B, 1) && size(B, 2) == size(A, 1) ||
@@ -3493,7 +4225,11 @@ get_mat(operator::ExpOp; dense::Bool=true, shift=nothing, kwargs...) =
 _exp_source(operator::AbstractMatrix; kwargs...) = operator
 _exp_source(operator::Hamiltonian; time=0, kwargs...) =
     aslinearoperator(operator; time)
-_exp_source(operator::QuantumOperator; pars::AbstractDict=Dict(), kwargs...) =
+_exp_source(
+    operator::QuantumOperator;
+    pars::AbstractDict=Dict{Any,eltype(operator)}(),
+    kwargs...,
+) =
     aslinearoperator(operator; pars)
 
 function _exp_apply_single(

@@ -5,9 +5,9 @@ Internal description of a symmetry-reduced basis.
 parent basis. Keeping this map explicit makes every reduced operator a true
 `P' * O * P` projection and also gives `projection_matrix` exact semantics.
 """
-struct SymmetryData
-    parent_states::Vector{UInt64}
-    parent_lookup::Dict{UInt64,Int}
+struct SymmetryData{T<:Integer}
+    parent_states::Vector{T}
+    parent_lookup::Dict{T,Int}
     projector::SparseMatrixCSC{ComplexF64,Int}
     parent_occupations::Base.RefValue{Union{Nothing,Matrix{Int}}}
     blocks::Dict{Symbol,Any}
@@ -15,14 +15,14 @@ struct SymmetryData
 end
 
 function _identity_symmetry_data(
-    states::Vector{UInt64},
+    states::Vector{T},
     blocks,
-    lookup::Dict{UInt64,Int}=Dict(
+    lookup::Dict{T,Int}=Dict(
         state => index for (index, state) in pairs(states)
     ),
     ;
     parent_occupations=nothing,
-)
+) where {T<:Integer}
     return SymmetryData(
         states,
         lookup,
@@ -36,10 +36,10 @@ end
 const _MAX_DENSE_SYMMETRY_FALLBACK = 512
 
 function _signed_permutation(
-    states::Vector{UInt64},
-    lookup::Dict{UInt64,Int},
+    states::Vector{T},
+    lookup::Dict{T,Int},
     transform,
-)
+) where {T<:Integer}
     rows = Vector{Int}(undef, length(states))
     values = Vector{ComplexF64}(undef, length(states))
     for (column, state) in pairs(states)
@@ -55,11 +55,11 @@ function _signed_permutation(
 end
 
 function _cyclic_projector(
-    states::Vector{UInt64},
-    lookup::Dict{UInt64,Int},
+    states::Vector{T},
+    lookup::Dict{T,Int},
     transform,
     eigenvalue::ComplexF64,
-)
+) where {T<:Integer}
     visited = falses(length(states))
     rows = Int[]
     columns = Int[]
@@ -213,10 +213,10 @@ function _intersect_eigenspace(
 end
 
 function _representative_states(
-    parent_states::Vector{UInt64},
+    parent_states::Vector{T},
     projector::SparseMatrixCSC,
-)
-    representatives = UInt64[]
+) where {T<:Integer}
+    representatives = T[]
     for column in axes(projector, 2)
         rows, values = findnz(@view projector[:, column])
         isempty(rows) && continue
@@ -232,12 +232,12 @@ function _representative_states(
 end
 
 function _finalize_symmetry_data(
-    parent_states::Vector{UInt64},
+    parent_states::Vector{T},
     projector::SparseMatrixCSC,
     blocks,
     ;
     parent_occupations=nothing,
-)
+) where {T<:Integer}
     size(projector, 2) > 0 ||
         throw(ArgumentError("the requested symmetry sector is empty"))
     gram = sparse(projector' * projector)
@@ -364,13 +364,13 @@ function _site_permutation_transform(
 end
 
 function _full_projection_matrix(
-    states::Vector{UInt64},
+    states::Vector{TState},
     symmetry::SymmetryData,
     full_dimension::Int,
     ::Type{T},
     ;
     sparse_output::Bool=false,
-) where {T<:Number}
+) where {TState<:Integer,T<:Number}
     if !symmetry.reduced
         rows = Int[Int(state) + 1 for state in symmetry.parent_states]
         values = ones(T, length(rows))
@@ -411,6 +411,7 @@ function _project_from_full(
     symmetry::SymmetryData,
     vector::AbstractVecOrMat,
     full_dimension::Int,
+    sparse_output::Bool,
 )
     if SparseArrays.issparse(vector)
         projected = _full_projection_matrix(
@@ -420,7 +421,8 @@ function _project_from_full(
             eltype(vector);
             sparse_output=true,
         )
-        return projected * vector
+        result = projected * vector
+        return sparse_output ? result : collect(result)
     end
     requires_complex = symmetry.reduced &&
         maximum(abs ∘ imag, nonzeros(symmetry.projector); init=0.0) > 2e-12
@@ -439,7 +441,7 @@ function _project_from_full(
     if vector isa AbstractVector
         result = zeros(eltype(parent_coordinates), full_dimension)
         result[rows] = parent_coordinates
-        return result
+        return sparse_output ? SparseArrays.sparse(result) : result
     end
     result = zeros(
         eltype(parent_coordinates),
@@ -447,7 +449,55 @@ function _project_from_full(
         size(vector, 2),
     )
     result[rows, :] = parent_coordinates
-    return result
+    return sparse_output ? SparseArrays.sparse(result) : result
+end
+
+function _project_from_parent(
+    symmetry::SymmetryData,
+    vector::AbstractVecOrMat,
+    sparse_output::Bool,
+)
+    requires_complex = symmetry.reduced &&
+        maximum(abs ∘ imag, nonzeros(symmetry.projector); init=0.0) >
+        2e-12
+    if eltype(vector) <: Real && requires_complex
+        throw(ArgumentError(
+            "this momentum sector requires a complex projection dtype",
+        ))
+    end
+    result = symmetry.reduced ? symmetry.projector * vector : copy(vector)
+    if sparse_output
+        return SparseArrays.issparse(result) ?
+            result :
+            SparseArrays.sparse(result)
+    end
+    return SparseArrays.issparse(result) ? collect(result) : result
+end
+
+function _parent_projection_matrix(
+    symmetry::SymmetryData,
+    ::Type{T},
+) where {T<:Number}
+    if !symmetry.reduced
+        return spdiagm(
+            0 => ones(T, length(symmetry.parent_states)),
+        )
+    end
+    if T <: Real
+        maximum(abs ∘ imag, nonzeros(symmetry.projector); init=0.0) <=
+            2e-12 ||
+            throw(ArgumentError(
+                "this momentum sector requires a complex projection dtype",
+            ))
+        return SparseMatrixCSC{T,Int}(
+            size(symmetry.projector, 1),
+            size(symmetry.projector, 2),
+            copy(symmetry.projector.colptr),
+            copy(rowvals(symmetry.projector)),
+            T.(real.(nonzeros(symmetry.projector))),
+        )
+    end
+    return SparseMatrixCSC{T,Int}(symmetry.projector)
 end
 
 function _accumulate_projected_triplets!(
@@ -476,6 +526,97 @@ function _accumulate_projected_triplets!(
         end
     end
     return output
+end
+
+function _projected_triplet_matrix(
+    projector::SparseMatrixCSC,
+    parent_rows,
+    parent_columns,
+    parent_values,
+)
+    parent_to_reduced = zeros(Int, size(projector, 1))
+    parent_coefficients = zeros(eltype(projector), size(projector, 1))
+    projector_rows = rowvals(projector)
+    projector_values = nonzeros(projector)
+    multiple_per_parent = false
+    @inbounds for reduced_column in axes(projector, 2)
+        for pointer in nzrange(projector, reduced_column)
+            parent_row = projector_rows[pointer]
+            if parent_to_reduced[parent_row] != 0
+                multiple_per_parent = true
+                break
+            end
+            parent_to_reduced[parent_row] = reduced_column
+            parent_coefficients[parent_row] = projector_values[pointer]
+        end
+        multiple_per_parent && break
+    end
+    if !multiple_per_parent
+        T = promote_type(eltype(projector), eltype(parent_values))
+        accumulated = Dict{Tuple{Int,Int},T}()
+        @inbounds for entry in eachindex(parent_values)
+            parent_row = parent_rows[entry]
+            parent_column = parent_columns[entry]
+            reduced_row = parent_to_reduced[parent_row]
+            reduced_column = parent_to_reduced[parent_column]
+            (reduced_row == 0 || reduced_column == 0) && continue
+            value =
+                conj(parent_coefficients[parent_row]) *
+                parent_values[entry] *
+                parent_coefficients[parent_column]
+            iszero(value) && continue
+            key = (reduced_row, reduced_column)
+            accumulated[key] =
+                get(accumulated, key, zero(T)) + value
+        end
+        rows = Int[]
+        columns = Int[]
+        values = T[]
+        sizehint!(rows, length(accumulated))
+        sizehint!(columns, length(accumulated))
+        sizehint!(values, length(accumulated))
+        for ((row, column), value) in accumulated
+            iszero(value) && continue
+            push!(rows, row)
+            push!(columns, column)
+            push!(values, value)
+        end
+        dimension = size(projector, 2)
+        return sparse(rows, columns, values, dimension, dimension)
+    end
+
+    adjoint_projector = sparse(adjoint(projector))
+    reduced_rows = rowvals(adjoint_projector)
+    coefficients = nonzeros(adjoint_projector)
+    T = promote_type(eltype(projector), eltype(parent_values))
+    accumulated = Dict{Tuple{Int,Int},T}()
+    @inbounds for entry in eachindex(parent_values)
+        parent_row = parent_rows[entry]
+        parent_column = parent_columns[entry]
+        matrix_value = parent_values[entry]
+        for left_pointer in nzrange(adjoint_projector, parent_row)
+            reduced_row = reduced_rows[left_pointer]
+            left_value = coefficients[left_pointer]
+            for right_pointer in nzrange(adjoint_projector, parent_column)
+                reduced_column = reduced_rows[right_pointer]
+                right_value = conj(coefficients[right_pointer])
+                key = (reduced_row, reduced_column)
+                accumulated[key] = get(accumulated, key, zero(T)) +
+                    left_value * matrix_value * right_value
+            end
+        end
+    end
+    rows = Int[]
+    columns = Int[]
+    values = T[]
+    for ((row, column), value) in accumulated
+        abs(value) <= 20eps(real(float(one(T)))) && continue
+        push!(rows, row)
+        push!(columns, column)
+        push!(values, value)
+    end
+    dimension = size(projector, 2)
+    return sparse(rows, columns, values, dimension, dimension)
 end
 
 _has_symmetry(data::SymmetryData) = data.reduced

@@ -13,10 +13,12 @@ The current migration covers the frozen QuSpin 1.0.1 denominator:
 - 64 top-level objects: 20 classes, 40 functions, and 4 values;
 - 282 public methods (excluding constructors) and 180 public attributes;
 - spin, boson, spinless/spinful fermion, photon, tensor, and user-defined bases;
+- arbitrary finite-order general-lattice maps, higher-spin local spaces, and
+  deferred or threaded basis construction;
 - static and time-dependent Hamiltonians, parameterized operators, and
   matrix-exponential actions;
 - evolution, Lanczos, measurements, Floquet, and symmetry-block tools;
-- Julia-native `QuantumOperator` persistence.
+- native and Python-compatible `QuantumOperator` persistence.
 
 Python names are translated to Julia conventions where appropriate: types use
 CamelCase, mutating operations end in `!`, and lattice sites are one-based.
@@ -77,6 +79,21 @@ Operators in a reduced basis are defined by the same projector,
 `P' * O * P`. `check_symm`, `check_pcon`, and `check_hermitian` reject
 incompatible operator lists; `representative`, `normalization`, and
 `get_amp` use the actual orbit amplitudes.
+
+`SpinBasisGeneral`, `BosonBasisGeneral`, `SpinlessFermionBasisGeneral`, and
+`SpinfulFermionBasisGeneral` accept independent finite-order site maps, so
+commuting two-dimensional translations and compatible point-group sectors do
+not need to be flattened into one-dimensional built-ins. Spin bases also
+support `S=1, 3/2, ...` with exact angular-momentum matrix elements.
+
+## Operator archives
+
+`save_zip(path, operator)` retains the versioned native Julia format.
+`save_zip(path, operator; save_basis=false, format=:python)` writes the
+dense/CSC NPZ layout used by Python QuSpin, and `load_zip` detects either
+format. The archive dependencies are loaded only when this compatibility path
+is used, so ordinary package startup and computations do not pay its load
+cost.
 
 ## Matrix-free and Krylov paths
 

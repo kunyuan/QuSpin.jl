@@ -15,11 +15,8 @@ struct DiscreteBasis{K} <: AbstractBasis
 end
 
 const BosonBasis1D = DiscreteBasis{:boson}
-const BosonBasisGeneral = DiscreteBasis{:boson}
 const SpinlessFermionBasis1D = DiscreteBasis{:spinless_fermion}
-const SpinlessFermionBasisGeneral = DiscreteBasis{:spinless_fermion}
 const SpinfulFermionBasis1D = DiscreteBasis{:spinful_fermion}
-const SpinfulFermionBasisGeneral = DiscreteBasis{:spinful_fermion}
 
 function _digits(value::Integer, L::Integer, sps::Integer)
     remaining = Int(value)
@@ -77,17 +74,37 @@ function _make_discrete_basis(
     keep,
     description,
     operators,
+    ;
+    parallel::Bool=false,
 ) where {K}
     L > 0 || throw(ArgumentError("L must be positive"))
-    sps > 1 || throw(ArgumentError("sps must exceed one"))
+    sps >= 1 || throw(ArgumentError("sps must be positive"))
     dimension = BigInt(sps)^L
     dimension <= typemax(UInt64) ||
         throw(ArgumentError("basis encoding exceeds UInt64"))
     encoded = UInt64[]
-    for value in UInt64(0):(UInt64(dimension) - 1)
-        occupations = _digits(value, L, sps)
-        keep(occupations) || continue
-        push!(encoded, value)
+    if parallel && Threads.nthreads() > 1
+        dimension <= typemax(Int) ||
+            throw(ArgumentError(
+                "parallel basis construction requires an Int-sized state space",
+            ))
+        # `threadid()` may include the interactive pool, so allocate by the
+        # maximum runtime id rather than only the default-pool thread count.
+        local_states = [UInt64[] for _ in 1:Threads.maxthreadid()]
+        Threads.@threads for raw_value in 0:(Int(dimension) - 1)
+            value = UInt64(raw_value)
+            occupations = _digits(value, L, sps)
+            keep(occupations) || continue
+            push!(local_states[Threads.threadid()], value)
+        end
+        encoded = reduce(vcat, local_states; init=UInt64[])
+        sort!(encoded)
+    else
+        for value in UInt64(0):(UInt64(dimension) - 1)
+            occupations = _digits(value, L, sps)
+            keep(occupations) || continue
+            push!(encoded, value)
+        end
     end
     return _discrete_basis_from_encoded(
         Val(K),
@@ -389,6 +406,17 @@ function DiscreteBasis{:boson}(
     )
 end
 
+"""
+    HOBasis(Np)
+
+Truncated single-mode harmonic-oscillator basis with number states
+`0:Np`. This is the Julia counterpart of QuSpin's public `ho_basis`.
+"""
+function HOBasis(Np::Integer)
+    Np >= 0 || throw(ArgumentError("Np must be nonnegative"))
+    return BosonBasis1D(1; sps=Int(Np) + 1)
+end
+
 function DiscreteBasis{:spinless_fermion}(
     L::Integer;
     Nf=nothing,
@@ -416,7 +444,7 @@ function DiscreteBasis{:spinless_fermion}(
             selected_particles,
             keep,
             "spinless fermion lattice basis",
-            ("I", "+", "-", "n", "z"),
+            ("I", "+", "-", "n", "z", "x", "y"),
         )
     else
         encoded = UInt64[]
@@ -432,7 +460,7 @@ function DiscreteBasis{:spinless_fermion}(
             selected_particles,
             encoded,
             "spinless fermion lattice basis",
-            ("I", "+", "-", "n", "z"),
+            ("I", "+", "-", "n", "z", "x", "y"),
         )
     end
     return _discrete_symmetry_basis(basis; a, kblock, pblock)
@@ -442,6 +470,7 @@ function DiscreteBasis{:spinful_fermion}(
     L::Integer;
     Nf=nothing,
     nf=nothing,
+    double_occupancy::Bool=true,
     a::Integer=1,
     kblock=nothing,
     pblock=nothing,
@@ -457,14 +486,28 @@ function DiscreteBasis{:spinful_fermion}(
     else
         nothing
     end
-    wanted = selected_particles === nothing ?
-        nothing :
-        Tuple(Int.(selected_particles))
-    keep = occupations -> wanted === nothing || (
-        count(digit -> digit & 1 == 1, occupations) == wanted[1] &&
-        count(digit -> digit & 2 == 2, occupations) == wanted[2]
-    )
-    basis = if wanted === nothing
+    sectors = if selected_particles === nothing
+        nothing
+    elseif selected_particles isa Tuple &&
+           length(selected_particles) == 2 &&
+           all(value -> value isa Integer, selected_particles)
+        Tuple{Int,Int}[(Int(selected_particles[1]), Int(selected_particles[2]))]
+    else
+        Tuple{Int,Int}[
+            (Int(sector[1]), Int(sector[2]))
+            for sector in selected_particles
+        ]
+    end
+    keep = occupations -> begin
+        double_occupancy || all(digit -> digit != 3, occupations) || return false
+        sectors === nothing && return true
+        particle_numbers = (
+            count(digit -> digit & 1 == 1, occupations),
+            count(digit -> digit & 2 == 2, occupations),
+        )
+        return particle_numbers in sectors
+    end
+    basis = if sectors === nothing
         _make_discrete_basis(
             Val(:spinful_fermion),
             L,
@@ -472,24 +515,32 @@ function DiscreteBasis{:spinful_fermion}(
             selected_particles,
             keep,
             "spinful fermion lattice basis",
-            ("I", "+", "-", "n", "z", "|"),
+            ("I", "+", "-", "n", "z", "x", "y", "|"),
         )
-    elseif all(particles -> 0 <= particles <= L, wanted)
-        up_states = _fixed_weight_states(Int(L), wanted[1])
-        down_states = _fixed_weight_states(Int(L), wanted[2])
-        encoded = Vector{UInt64}(undef, length(up_states) * length(down_states))
-        index = 0
-        for up in up_states, down in down_states
-            value = zero(UInt64)
-            for site in 0:(Int(L) - 1)
-                up_bit = (up >> site) & UInt64(1)
-                down_bit = (down >> site) & UInt64(1)
-                value |= (up_bit | (down_bit << 1)) << (2 * site)
+    elseif all(
+        sector -> all(particles -> 0 <= particles <= L, sector),
+        sectors,
+    )
+        encoded = UInt64[]
+        for (up_particles, down_particles) in sectors
+            up_states = _fixed_weight_states(Int(L), up_particles)
+            down_states = _fixed_weight_states(Int(L), down_particles)
+            for up in up_states, down in down_states
+                value = zero(UInt64)
+                valid = true
+                for site in 0:(Int(L) - 1)
+                    up_bit = (up >> site) & UInt64(1)
+                    down_bit = (down >> site) & UInt64(1)
+                    if !double_occupancy && isone(up_bit) && isone(down_bit)
+                        valid = false
+                        break
+                    end
+                    value |= (up_bit | (down_bit << 1)) << (2 * site)
+                end
+                valid && push!(encoded, value)
             end
-            index += 1
-            encoded[index] = value
         end
-        sort!(encoded)
+        sort!(unique!(encoded))
         _discrete_basis_from_encoded(
             Val(:spinful_fermion),
             L,
@@ -497,7 +548,7 @@ function DiscreteBasis{:spinful_fermion}(
             selected_particles,
             encoded,
             "spinful fermion lattice basis",
-            ("I", "+", "-", "n", "z", "|"),
+            ("I", "+", "-", "n", "z", "x", "y", "|"),
         )
     else
         _discrete_basis_from_encoded(
@@ -507,7 +558,7 @@ function DiscreteBasis{:spinful_fermion}(
             selected_particles,
             UInt64[],
             "spinful fermion lattice basis",
-            ("I", "+", "-", "n", "z", "|"),
+            ("I", "+", "-", "n", "z", "x", "y", "|"),
         )
     end
     return _discrete_symmetry_basis(
@@ -520,6 +571,463 @@ function DiscreteBasis{:spinful_fermion}(
     )
 end
 
+function DiscreteBasis{:spin}(
+    L::Integer;
+    S=1,
+    nup=nothing,
+    Nup=nothing,
+    m=nothing,
+    pauli::Bool=false,
+    a::Integer=1,
+    kblock=nothing,
+    pblock=nothing,
+    zblock=nothing,
+    pzblock=nothing,
+    zAblock=nothing,
+    zBblock=nothing,
+)
+    spin = _parse_spin_value(S)
+    sps = Int(2spin + 1)
+    nup !== nothing && Nup !== nothing &&
+        throw(ArgumentError("specify only one of nup and Nup"))
+    selected = nup === nothing ? Nup : nup
+    if m !== nothing
+        selected === nothing ||
+            throw(ArgumentError("m cannot be combined with nup or Nup"))
+        selected = round(Int, (float(m) + float(spin)) * L)
+    end
+    totals = selected === nothing ?
+        nothing :
+        Set(selected isa Integer ? [Int(selected)] : Int.(collect(selected)))
+    totals === nothing || all(0 .<= collect(totals) .<= L * (sps - 1)) ||
+        throw(ArgumentError("Nup lies outside the higher-spin Hilbert space"))
+    encoded = totals === nothing ?
+        collect(UInt64(0):(UInt64(sps)^Int(L) - UInt64(1))) :
+        _bounded_composition_states(Int(L), sps, totals)
+    basis = _discrete_basis_from_encoded(
+        Val(:spin),
+        L,
+        sps,
+        selected,
+        encoded,
+        "spin-$spin lattice basis",
+        ("I", "+", "-", "z", "x", "y"),
+    )
+    any(value !== nothing for value in (zblock, pzblock, zAblock, zBblock)) &&
+        throw(ArgumentError(
+            "higher-spin inversion blocks are available through SpinBasisGeneral maps",
+        ))
+    return _discrete_symmetry_basis(basis; a, kblock, pblock)
+end
+
+function _advanced_fermion_transform(
+    basis::DiscreteBasis{K},
+    map,
+) where {K}
+    values = Int.(collect(map))
+    mode_count = K === :spinful_fermion ? 2basis.L : basis.L
+    length(values) == mode_count ||
+        throw(ArgumentError(
+            "advanced fermion maps require one entry per fermionic mode",
+        ))
+    zero_based = any(iszero, values) || any(<(0), values)
+    destinations = Vector{Int}(undef, mode_count)
+    flips = falses(mode_count)
+    for source in 1:mode_count
+        value = values[source]
+        destinations[source] = value < 0 ?
+            -value :
+            zero_based ? value + 1 : value
+        flips[source] = value < 0
+    end
+    sort(destinations) == collect(1:mode_count) ||
+        throw(ArgumentError(
+            "advanced fermion maps must be signed mode permutations",
+        ))
+    order = _general_spin_map_order(destinations, flips)
+    weights = UInt64[
+        UInt64(basis.sps)^(site - 1) for site in 1:basis.L
+    ]
+    transform = state -> begin
+        source_occupied = falses(mode_count)
+        if K === :spinless_fermion
+            for mode in 1:mode_count
+                source_occupied[mode] =
+                    !iszero(state & (UInt64(1) << (mode - 1)))
+            end
+        else
+            for site in 1:basis.L
+                digit = Int((state ÷ weights[site]) % UInt64(4))
+                source_occupied[site] = digit & 1 == 1
+                source_occupied[basis.L + site] = digit & 2 == 2
+            end
+        end
+
+        target_occupied = falses(mode_count)
+        for source in 1:mode_count
+            flips[source] &&
+                (target_occupied[destinations[source]] = true)
+        end
+        phase = 1.0 + 0im
+        for source in mode_count:-1:1
+            source_occupied[source] || continue
+            destination = destinations[source]
+            parity = count(@view target_occupied[1:(destination - 1)])
+            isodd(parity) && (phase = -phase)
+            if flips[source]
+                target_occupied[destination] ||
+                    throw(ArgumentError(
+                        "invalid particle-hole canonical transformation",
+                    ))
+                target_occupied[destination] = false
+                isodd(destination - 1) && (phase = -phase)
+            else
+                !target_occupied[destination] ||
+                    throw(ArgumentError(
+                        "invalid fermion mode permutation",
+                    ))
+                target_occupied[destination] = true
+            end
+        end
+
+        encoded = zero(UInt64)
+        if K === :spinless_fermion
+            for mode in 1:mode_count
+                target_occupied[mode] &&
+                    (encoded |= UInt64(1) << (mode - 1))
+            end
+        else
+            for site in 1:basis.L
+                target_occupied[site] &&
+                    (encoded += weights[site])
+                target_occupied[basis.L + site] &&
+                    (encoded += UInt64(2) * weights[site])
+            end
+        end
+        return encoded, phase
+    end
+    return transform, order
+end
+
+function _general_discrete_transform(
+    basis::DiscreteBasis{K},
+    map,
+) where {K}
+    if K === :spinful_fermion && length(map) == 2basis.L
+        return _advanced_fermion_transform(basis, map)
+    elseif K === :spinless_fermion &&
+           length(map) == basis.L &&
+           any(<(0), map)
+        return _advanced_fermion_transform(basis, map)
+    end
+    permutation, flips =
+        _normalize_general_spin_map(map, basis.L)
+    order = _general_spin_map_order(permutation, flips)
+    weights = UInt64[
+        UInt64(basis.sps)^(site - 1) for site in 1:basis.L
+    ]
+    if K === :spinful_fermion && any(flips)
+        mode_permutation = Vector{Int}(undef, 2basis.L)
+        for source in 1:basis.L
+            destination = permutation[source]
+            if flips[source]
+                mode_permutation[source] = basis.L + destination
+                mode_permutation[basis.L + source] = destination
+            else
+                mode_permutation[source] = destination
+                mode_permutation[basis.L + source] = basis.L + destination
+            end
+        end
+        transform = state -> begin
+            occupied_modes = Int[]
+            encoded = zero(UInt64)
+            for source in 1:basis.L
+                digit = Int((state ÷ weights[source]) % UInt64(4))
+                digit & 1 == 1 && push!(occupied_modes, source)
+                digit & 2 == 2 && push!(occupied_modes, basis.L + source)
+            end
+            sort!(occupied_modes)
+            for mode in occupied_modes
+                destination_mode = mode_permutation[mode]
+                destination_site = mod1(destination_mode, basis.L)
+                bit = destination_mode <= basis.L ? UInt64(1) : UInt64(2)
+                encoded += bit * weights[destination_site]
+            end
+            phase = _permutation_phase(occupied_modes, mode_permutation)
+            return encoded, phase
+        end
+        return transform, order
+    elseif K in (:spinless_fermion, :spinful_fermion) && any(flips)
+        throw(ArgumentError(
+            "particle-hole maps require advanced fermion notation",
+        ))
+    elseif K === :boson && any(flips)
+        transform = state -> begin
+            encoded = zero(UInt64)
+            for source in 1:basis.L
+                occupation =
+                    Int((state ÷ weights[source]) % UInt64(basis.sps))
+                flips[source] &&
+                    (occupation = basis.sps - 1 - occupation)
+                encoded += UInt64(occupation) * weights[permutation[source]]
+            end
+            return encoded, 1.0 + 0im
+        end
+        return transform, order
+    end
+    fermionic = K in (:spinless_fermion, :spinful_fermion)
+    spinful = K === :spinful_fermion
+    transform = state -> _site_permutation_transform(
+        state,
+        basis.sps,
+        permutation,
+        weights;
+        fermionic,
+        spinful,
+    )
+    return transform, order
+end
+
+function _general_discrete_basis(
+    basis::DiscreteBasis{K},
+    block_order,
+    blocks,
+) where {K}
+    isempty(blocks) && return basis
+    block_dictionary = Dict{Symbol,Any}(
+        Symbol(name) => value for (name, value) in blocks
+    )
+    ordered_names = block_order === nothing ?
+        Symbol[Symbol(name) for (name, _) in blocks] :
+        Symbol.(collect(block_order))
+    for name in keys(block_dictionary)
+        name in ordered_names || push!(ordered_names, name)
+    end
+    all(name -> haskey(block_dictionary, name), ordered_names) ||
+        throw(ArgumentError("block_order refers to an unknown symmetry block"))
+
+    parent_states = basis.encoded_states
+    projector = nothing
+    symmetry_blocks = copy(basis.symmetry.blocks)
+    for name in ordered_names
+        specification = block_dictionary[name]
+        (specification isa Tuple || specification isa AbstractVector) &&
+            length(specification) >= 2 ||
+            throw(ArgumentError(
+                "general symmetry blocks must be (map, quantum_number)",
+            ))
+        transform, order =
+            _general_discrete_transform(basis, specification[1])
+        quantum_number = Int(specification[2])
+        eigenvalue = cis(2π * mod(quantum_number, order) / order)
+        projector = if projector === nothing
+            _cyclic_projector(
+                parent_states,
+                basis.lookup,
+                transform,
+                ComplexF64(eigenvalue),
+            )
+        else
+            _intersect_eigenspace(
+                projector,
+                _signed_permutation(parent_states, basis.lookup, transform),
+                ComplexF64(eigenvalue),
+            )
+        end
+        symmetry_blocks[name] = mod(quantum_number, order)
+        symmetry_blocks[Symbol(name, :_period)] = order
+    end
+    symmetry_blocks[:block_order] = copy(ordered_names)
+    symmetry = _finalize_symmetry_data(
+        parent_states,
+        projector,
+        symmetry_blocks;
+        parent_occupations=basis.occupations,
+    )
+    representatives =
+        _representative_states(parent_states, symmetry.projector)
+    occupations = isempty(representatives) ?
+        Matrix{Int}(undef, 0, basis.L) :
+        reduce(vcat, permutedims.(
+            _digits(state, basis.L, basis.sps)
+            for state in representatives
+        ))
+    return DiscreteBasis{K}(
+        basis.L,
+        basis.sps,
+        basis.conservation,
+        representatives,
+        occupations,
+        Dict(state => index for (index, state) in pairs(representatives)),
+        basis.description,
+        basis.operators,
+        symmetry,
+    )
+end
+
+function _deferred_discrete_metadata(
+    L,
+    sps,
+    conservation,
+    description,
+    operators,
+    blocks,
+    Ns_block_est,
+)
+    metadata = Dict{Symbol,Any}(
+        :L => Int(L),
+        :N => Int(L),
+        :Ns => 1,
+        :sps => Int(sps),
+        :dtype => UInt64,
+        :states => UInt64[0],
+        :encoded_states => UInt64[0],
+        :conservation => conservation,
+        :description => description,
+        :operators => Tuple(operators),
+        :noncommuting_bits => Tuple{Vector{Int},Int}[],
+        :blocks => Dict{Symbol,Any}(
+            Symbol(name) => value for (name, value) in blocks
+        ),
+    )
+    Ns_block_est === nothing ||
+        (metadata[:Ns_block_est] = Int(Ns_block_est))
+    return metadata
+end
+
+function BosonBasisGeneral(
+    L::Integer;
+    Nb=nothing,
+    nb=nothing,
+    sps::Union{Nothing,Integer}=nothing,
+    Ns_block_est=nothing,
+    make_basis::Bool=true,
+    block_order=nothing,
+    blocks...,
+)
+    if !make_basis
+        block_keywords = (; blocks...)
+        selected_particles = Nb === nothing ? nb : Nb
+        local_dimension = sps === nothing ?
+            (
+                selected_particles isa Integer ?
+                Int(selected_particles) + 1 :
+                2
+            ) :
+            Int(sps)
+        builder = () -> BosonBasisGeneral(
+            L;
+            Nb,
+            nb,
+            sps,
+            Ns_block_est,
+            make_basis=true,
+            block_order,
+            block_keywords...,
+        )
+        metadata = _deferred_discrete_metadata(
+            L,
+            local_dimension,
+            selected_particles,
+            "deferred boson general basis",
+            ("I", "+", "-", "n", "z"),
+            blocks,
+            Ns_block_est,
+        )
+        return _deferred_basis(DiscreteBasis{:boson}, builder, metadata)
+    end
+    basis = BosonBasis1D(L; Nb, nb, sps)
+    return _general_discrete_basis(basis, block_order, blocks)
+end
+
+function SpinlessFermionBasisGeneral(
+    L::Integer;
+    Nf=nothing,
+    nf=nothing,
+    Ns_block_est=nothing,
+    make_basis::Bool=true,
+    block_order=nothing,
+    blocks...,
+)
+    if !make_basis
+        block_keywords = (; blocks...)
+        selected_particles = Nf === nothing ? nf : Nf
+        builder = () -> SpinlessFermionBasisGeneral(
+            L;
+            Nf,
+            nf,
+            Ns_block_est,
+            make_basis=true,
+            block_order,
+            block_keywords...,
+        )
+        metadata = _deferred_discrete_metadata(
+            L,
+            2,
+            selected_particles,
+            "deferred spinless-fermion general basis",
+            ("I", "+", "-", "n", "z"),
+            blocks,
+            Ns_block_est,
+        )
+        metadata[:noncommuting_bits] = [collect(1:Int(L)) => -1]
+        return _deferred_basis(
+            DiscreteBasis{:spinless_fermion},
+            builder,
+            metadata,
+        )
+    end
+    basis = SpinlessFermionBasis1D(L; Nf, nf)
+    return _general_discrete_basis(basis, block_order, blocks)
+end
+
+function SpinfulFermionBasisGeneral(
+    L::Integer;
+    Nf=nothing,
+    nf=nothing,
+    Ns_block_est=nothing,
+    simple_symm::Bool=true,
+    make_basis::Bool=true,
+    block_order=nothing,
+    double_occupancy::Bool=true,
+    blocks...,
+)
+    if !make_basis
+        block_keywords = (; blocks...)
+        selected_particles = Nf === nothing ? nf : Nf
+        builder = () -> SpinfulFermionBasisGeneral(
+            L;
+            Nf,
+            nf,
+            Ns_block_est,
+            simple_symm,
+            make_basis=true,
+            block_order,
+            double_occupancy,
+            block_keywords...,
+        )
+        metadata = _deferred_discrete_metadata(
+            2Int(L),
+            2,
+            selected_particles,
+            "deferred spinful-fermion general basis",
+            ("I", "+", "-", "n", "z", "|"),
+            blocks,
+            Ns_block_est,
+        )
+        metadata[:L] = Int(L)
+        metadata[:N] = Int(L)
+        metadata[:double_occupancy] = double_occupancy
+        return _deferred_basis(
+            DiscreteBasis{:spinful_fermion},
+            builder,
+            metadata,
+        )
+    end
+    basis = SpinfulFermionBasis1D(L; Nf, nf, double_occupancy)
+    return _general_discrete_basis(basis, block_order, blocks)
+end
+
 Base.length(basis::DiscreteBasis) = length(basis.encoded_states)
 Base.:(==)(left::DiscreteBasis{K}, right::DiscreteBasis{K}) where {K} =
     left.L == right.L &&
@@ -530,6 +1038,8 @@ Base.:(==)(left::DiscreteBasis{K}, right::DiscreteBasis{K}) where {K} =
 
 function Base.getproperty(basis::DiscreteBasis{K}, name::Symbol) where {K}
     name in (:N, :L) && return getfield(basis, :L)
+    name === :Np && K === :boson && getfield(basis, :L) == 1 &&
+        return getfield(basis, :sps) - 1
     name === :Ns && return length(getfield(basis, :encoded_states))
     name === :blocks && return copy(getfield(basis, :symmetry).blocks)
     name === :dtype && return UInt64
@@ -547,7 +1057,12 @@ function projection_matrix(
     ::Type{T}=Float64,
     ;
     sparse::Bool=false,
+    pcon::Bool=false,
 ) where {T<:Number}
+    if pcon
+        projected = _parent_projection_matrix(basis.symmetry, T)
+        return sparse ? projected : Matrix(projected)
+    end
     return _full_projection_matrix(
         basis.encoded_states,
         basis.symmetry,
@@ -558,6 +1073,11 @@ function projection_matrix(
 end
 
 _full_projection_dimension(basis::DiscreteBasis) = basis.sps^basis.L
+_projection_output_dimension(basis::DiscreteBasis, pcon::Bool) =
+    pcon ? length(basis.symmetry.parent_states) :
+    _full_projection_dimension(basis)
+_pcon_projection_matrix(basis::DiscreteBasis, ::Type{T}) where {T<:Number} =
+    _parent_projection_matrix(basis.symmetry, T)
 
 function project_from(
     basis::DiscreteBasis,
@@ -567,17 +1087,45 @@ function project_from(
 )
     size(vector, 1) == length(basis) ||
         throw(DimensionMismatch("the first vector dimension must equal Ns"))
+    pcon &&
+        return _project_from_parent(
+            basis.symmetry,
+            vector,
+            sparse,
+        )
     return _project_from_full(
         basis.symmetry,
         vector,
         basis.sps^basis.L,
+        sparse,
     )
 end
 
 get_vec(basis::DiscreteBasis, vector::AbstractVecOrMat; kwargs...) =
     project_from(basis, vector; kwargs...)
-expanded_form(basis::DiscreteBasis, static=Any[], dynamic=Any[]) =
-    (static, dynamic)
+
+function _xy_expansion_choices(
+    ::DiscreteBasis{K},
+    operator::Char,
+) where {K}
+    if K === :spin
+        operator == 'x' &&
+            return (('+', 0.5 + 0im), ('-', 0.5 + 0im))
+        operator == 'y' &&
+            return (('+', -0.5im), ('-', 0.5im))
+    elseif K in (:spinless_fermion, :spinful_fermion)
+        operator == 'x' &&
+            return (('+', 1.0 + 0im), ('-', 1.0 + 0im))
+        operator == 'y' &&
+            return (('+', 1.0im), ('-', -1.0im))
+    end
+    return ((operator, 1.0 + 0im),)
+end
+
+expanded_form(basis::DiscreteBasis, static=Any[], dynamic=Any[]) = (
+    _expanded_form_entries(basis, static, false),
+    _expanded_form_entries(basis, dynamic, true),
+)
 
 function state_index(basis::DiscreteBasis, state::Integer)
     state >= 0 || throw(ArgumentError("state must be nonnegative"))
@@ -789,6 +1337,72 @@ function _discrete_reductions(
            need_A ? rho_A : rho_B
 end
 
+function _spinful_species_reductions(
+    basis::DiscreteBasis{:spinful_fermion},
+    state::AbstractVecOrMat,
+    subsystem,
+    return_rdm,
+)
+    length(subsystem) == 2 ||
+        throw(ArgumentError("spinful subsystem must be (up_sites, down_sites)"))
+    up_sites = sort!(unique(Int.(collect(subsystem[1]))))
+    down_sites = sort!(unique(Int.(collect(subsystem[2]))))
+    all(site -> 1 <= site <= basis.L, up_sites) &&
+        all(site -> 1 <= site <= basis.L, down_sites) ||
+        throw(ArgumentError("spinful subsystem sites lie outside the lattice"))
+    selected_modes = vcat(up_sites, basis.L .+ down_sites)
+    complement_modes =
+        setdiff(collect(1:(2basis.L)), selected_modes)
+    dimension_A = 1 << length(selected_modes)
+    dimension_B = 1 << length(complement_modes)
+    function mode_index(occupations, modes)
+        index = 0
+        for mode in modes
+            site = mod1(mode, basis.L)
+            digit = occupations[site]
+            occupied = mode <= basis.L ?
+                digit & 1 == 1 :
+                digit & 2 == 2
+            index = (index << 1) | Int(occupied)
+        end
+        return index + 1
+    end
+    indices_A = [
+        mode_index(@view(basis.occupations[row, :]), selected_modes)
+        for row in axes(basis.occupations, 1)
+    ]
+    indices_B = [
+        mode_index(@view(basis.occupations[row, :]), complement_modes)
+        for row in axes(basis.occupations, 1)
+    ]
+    if state isa AbstractVector
+        length(state) == length(basis) ||
+            throw(DimensionMismatch("state length must equal Ns"))
+        coefficients =
+            zeros(eltype(state), dimension_A, dimension_B)
+        for row in eachindex(state)
+            coefficients[indices_A[row], indices_B[row]] = state[row]
+        end
+        rho_A = coefficients * coefficients'
+        rho_B = coefficients' * coefficients
+    else
+        size(state) == (length(basis), length(basis)) ||
+            throw(DimensionMismatch("density matrix must match Ns"))
+        rho_A = zeros(eltype(state), dimension_A, dimension_A)
+        rho_B = zeros(eltype(state), dimension_B, dimension_B)
+        for row in axes(state, 1), column in axes(state, 2)
+            indices_B[row] == indices_B[column] &&
+                (rho_A[indices_A[row], indices_A[column]] += state[row, column])
+            indices_A[row] == indices_A[column] &&
+                (rho_B[indices_B[row], indices_B[column]] += state[row, column])
+        end
+    end
+    return return_rdm in (:A, "A") ? rho_A :
+           return_rdm in (:B, "B") ? rho_B :
+           return_rdm in (:both, "both") ? (rho_A, rho_B) :
+           throw(ArgumentError("return_rdm must be A, B, or both"))
+end
+
 function partial_trace(
     basis::DiscreteBasis,
     state::AbstractVecOrMat;
@@ -813,6 +1427,15 @@ function partial_trace(
             return_rdm,
             enforce_pure,
             kwargs...,
+        )
+    end
+    if basis isa DiscreteBasis{:spinful_fermion} &&
+       sub_sys_A isa Tuple
+        return _spinful_species_reductions(
+            basis,
+            state,
+            sub_sys_A,
+            return_rdm,
         )
     end
     sites_A = _discrete_subsystem_sites(basis, sub_sys_A)
@@ -848,6 +1471,8 @@ function ent_entropy(
     sub_sys_A=nothing,
     density::Bool=true,
     return_rdm=nothing,
+    enforce_pure::Bool=false,
+    return_rdm_EVs::Bool=false,
     alpha::Real=1.0,
     kwargs...,
 )
@@ -869,6 +1494,7 @@ function ent_entropy(
             result["Sent_B"] = entropy / normalization_B
             result["rdm_B"] = coefficients' * coefficients
         end
+        return_rdm_EVs && (result["p_A"] = collect(probabilities))
         return result
     end
     need_B = return_rdm in (:B, "B", :both, "both")
@@ -878,6 +1504,7 @@ function ent_entropy(
             state;
             sub_sys_A=sites_A,
             return_rdm=:both,
+            enforce_pure,
         )
     else
         partial_trace(
@@ -885,13 +1512,47 @@ function ent_entropy(
             state;
             sub_sys_A=sites_A,
             return_rdm=:A,
+            enforce_pure,
         ), nothing
     end
     normalization_A = density && !isempty(sites_A) ? length(sites_A) : 1
     sites_B = basis.L - length(sites_A)
     normalization_B = density && sites_B > 0 ? sites_B : 1
+    if ndims(rho_A) == 3
+        probabilities_A = [
+            _density_eigenvalues(@view(rho_A[:, :, index]))
+            for index in axes(rho_A, 3)
+        ]
+        result = Dict{String,Any}(
+            "Sent_A" => [
+                _entropy_from_probabilities(probabilities, alpha) /
+                normalization_A
+                for probabilities in probabilities_A
+            ],
+        )
+        if return_rdm in (:A, "A", :both, "both")
+            result["rdm_A"] = rho_A
+        end
+        if need_B
+            result["Sent_B"] = [
+                _entropy_from_density(
+                    @view(rho_B[:, :, index]),
+                    alpha,
+                ) / normalization_B
+                for index in axes(rho_B, 3)
+            ]
+            result["rdm_B"] = rho_B
+        end
+        return_rdm_EVs &&
+            (result["p_A"] = reduce(hcat, probabilities_A))
+        return result
+    end
+    probabilities_A = _density_eigenvalues(rho_A)
     result = Dict{String,Any}(
-        "Sent_A" => _entropy_from_density(rho_A, alpha) / normalization_A,
+        "Sent_A" => _entropy_from_probabilities(
+            probabilities_A,
+            alpha,
+        ) / normalization_A,
     )
     if return_rdm in (:A, "A", :both, "both")
         result["rdm_A"] = rho_A
@@ -900,6 +1561,7 @@ function ent_entropy(
         result["Sent_B"] = _entropy_from_density(rho_B, alpha) / normalization_B
         result["rdm_B"] = rho_B
     end
+    return_rdm_EVs && (result["p_A"] = probabilities_A)
     return result
 end
 
@@ -960,10 +1622,10 @@ function _apply_discrete_local(
     elseif op == 'n'
         return float(value), true
     elseif op == 'z'
-        midpoint = K === :boson ? (basis.sps - 1) / 2 : 0.5
+        midpoint = K in (:boson, :spin) ? (basis.sps - 1) / 2 : 0.5
         return value - midpoint, true
     elseif op == '+'
-        maximum_value = K === :boson ? basis.sps - 1 : 1
+        maximum_value = K in (:boson, :spin) ? basis.sps - 1 : 1
         value < maximum_value || return 0.0, false
         prefix = K in (:spinless_fermion, :spinful_fermion) ?
             _fermion_prefix_occupation(basis, occupations, species, site) :
@@ -974,7 +1636,15 @@ function _apply_discrete_local(
         else
             occupations[site] += 1
         end
-        factor = K === :boson ? sqrt(value + 1) : 1.0
+        factor = if K === :boson
+            sqrt(value + 1)
+        elseif K === :spin
+            spin = (basis.sps - 1) / 2
+            magnetic = value - spin
+            sqrt(spin * (spin + 1) - magnetic * (magnetic + 1))
+        else
+            1.0
+        end
         return sign * factor, true
     elseif op == '-'
         value > 0 || return 0.0, false
@@ -987,7 +1657,15 @@ function _apply_discrete_local(
         else
             occupations[site] -= 1
         end
-        factor = K === :boson ? sqrt(value) : 1.0
+        factor = if K === :boson
+            sqrt(value)
+        elseif K === :spin
+            spin = (basis.sps - 1) / 2
+            magnetic = value - spin
+            sqrt(spin * (spin + 1) - magnetic * (magnetic - 1))
+        else
+            1.0
+        end
         return sign * factor, true
     end
     throw(ArgumentError("unsupported local operator '$op'"))
@@ -1073,11 +1751,11 @@ column never needs an occupation-vector copy or a full re-encoding pass.
     op == 'I' && return encoded, one(Float64), true
     op == 'n' && return encoded, float(value), true
     if op == 'z'
-        midpoint = K === :boson ? (basis.sps - 1) / 2 : 0.5
+        midpoint = K in (:boson, :spin) ? (basis.sps - 1) / 2 : 0.5
         return encoded, value - midpoint, true
     end
     if op == '+'
-        maximum_value = K === :boson ? basis.sps - 1 : 1
+        maximum_value = K in (:boson, :spin) ? basis.sps - 1 : 1
         value < maximum_value || return encoded, 0.0, false
         prefix = K in (:spinless_fermion, :spinful_fermion) ?
             _fermion_prefix_encoded(
@@ -1092,7 +1770,15 @@ column never needs an occupation-vector copy or a full re-encoding pass.
         increment = K === :spinful_fermion ?
             UInt64(species === :up ? 1 : 2) * weight :
             weight
-        factor = K === :boson ? sqrt(value + 1) : 1.0
+        factor = if K === :boson
+            sqrt(value + 1)
+        elseif K === :spin
+            spin = (basis.sps - 1) / 2
+            magnetic = value - spin
+            sqrt(spin * (spin + 1) - magnetic * (magnetic + 1))
+        else
+            1.0
+        end
         return encoded + increment, sign * factor, true
     end
     if op == '-'
@@ -1110,7 +1796,15 @@ column never needs an occupation-vector copy or a full re-encoding pass.
         decrement = K === :spinful_fermion ?
             UInt64(species === :up ? 1 : 2) * weight :
             weight
-        factor = K === :boson ? sqrt(value) : 1.0
+        factor = if K === :boson
+            sqrt(value)
+        elseif K === :spin
+            spin = (basis.sps - 1) / 2
+            magnetic = value - spin
+            sqrt(spin * (spin + 1) - magnetic * (magnetic - 1))
+        else
+            1.0
+        end
         return encoded - decrement, sign * factor, true
     end
     throw(ArgumentError("unsupported local operator '$op'"))
@@ -1152,6 +1846,82 @@ function _discrete_operator_triplets(
     opstring::AbstractString,
     couplings,
 )
+    if basis isa Union{
+        DiscreteBasis{:spinless_fermion},
+        DiscreteBasis{:spinful_fermion},
+    } && any(operator -> operator in ('x', 'y'), opstring)
+        expansions = Tuple{String,ComplexF64}[("", 1.0 + 0im)]
+        for operator in opstring
+            choices = if operator == 'x'
+                (('+', 1.0 + 0im), ('-', 1.0 + 0im))
+            elseif operator == 'y'
+                (('+', 1.0im), ('-', -1.0im))
+            else
+                ((operator, 1.0 + 0im),)
+            end
+            expansions = [
+                (prefix * string(expanded), coefficient * scale)
+                for (prefix, coefficient) in expansions
+                for (expanded, scale) in choices
+            ]
+        end
+        rows = Int[]
+        columns = Int[]
+        values = ComplexF64[]
+        for (expanded, scale) in expansions
+            scaled_couplings = [
+                (scale * first(coupling), Base.tail(coupling)...)
+                for coupling in couplings
+            ]
+            expanded_rows, expanded_columns, expanded_values =
+                _discrete_operator_triplets(
+                    basis,
+                    expanded,
+                    scaled_couplings,
+                )
+            append!(rows, expanded_rows)
+            append!(columns, expanded_columns)
+            append!(values, expanded_values)
+        end
+        return rows, columns, values
+    end
+    if basis isa DiscreteBasis{:spin} &&
+       any(operator -> operator in ('x', 'y'), opstring)
+        expansions = Tuple{String,ComplexF64}[("", 1.0 + 0im)]
+        for operator in opstring
+            choices = if operator == 'x'
+                (('+', 0.5 + 0im), ('-', 0.5 + 0im))
+            elseif operator == 'y'
+                (('+', -0.5im), ('-', 0.5im))
+            else
+                ((operator, 1.0 + 0im),)
+            end
+            expansions = [
+                (prefix * string(expanded), coefficient * scale)
+                for (prefix, coefficient) in expansions
+                for (expanded, scale) in choices
+            ]
+        end
+        rows = Int[]
+        columns = Int[]
+        values = ComplexF64[]
+        for (expanded, scale) in expansions
+            scaled_couplings = [
+                (scale * first(coupling), Base.tail(coupling)...)
+                for coupling in couplings
+            ]
+            expanded_rows, expanded_columns, expanded_values =
+                _discrete_operator_triplets(
+                    basis,
+                    expanded,
+                    scaled_couplings,
+                )
+            append!(rows, expanded_rows)
+            append!(columns, expanded_columns)
+            append!(values, expanded_values)
+        end
+        return rows, columns, values
+    end
     rows = Int[]
     columns = Int[]
     coefficient_type = isempty(couplings) ?
@@ -1225,16 +1995,14 @@ function operator_matrix(
 ) where {K}
     if _has_symmetry(basis.symmetry)
         parent = _discrete_parent_basis(basis)
-        parent_matrix = operator_matrix(
-            parent,
-            opstring,
-            couplings;
-            sparse=true,
+        rows, columns, values =
+            _discrete_operator_triplets(parent, opstring, couplings)
+        projected = _projected_triplet_matrix(
+            basis.symmetry.projector,
+            rows,
+            columns,
+            values,
         )
-        projected =
-            basis.symmetry.projector' *
-            parent_matrix *
-            basis.symmetry.projector
         return sparse ? projected : Matrix(projected)
     end
     rows, columns, values =
@@ -1273,6 +2041,11 @@ end
 function _parent_basis_for_checks(basis::SpinBasis1D)
     _has_symmetry(basis.symmetry) || return basis
     return _spin_parent_basis(basis)
+end
+
+function _parent_basis_for_checks(basis::WideSpinBasis)
+    _has_symmetry(basis.symmetry) || return basis
+    return _wide_spin_parent_basis(basis)
 end
 
 function _parent_basis_for_checks(basis::DiscreteBasis{K}) where {K}
@@ -1389,6 +2162,13 @@ function check_pcon(basis::SpinBasis1D, static, dynamic=Any[])
     end
 end
 
+function check_pcon(basis::WideSpinBasis, static, dynamic=Any[])
+    return all(_operator_strings(static, dynamic)) do opstring
+        !any(character -> character in ('x', 'y'), opstring) &&
+            _particle_change(opstring) == (0,)
+    end
+end
+
 function check_pcon(basis::DiscreteBasis, static, dynamic=Any[])
     basis.conservation === nothing && return true
     return all(_operator_strings(static, dynamic)) do opstring
@@ -1418,6 +2198,8 @@ end
 
 check_symm(basis::SpinBasis1D, static, dynamic=Any[]) =
     _check_projected_symmetry(basis, static, dynamic)
+check_symm(basis::WideSpinBasis, static, dynamic=Any[]) =
+    _check_projected_symmetry(basis, static, dynamic)
 check_symm(basis::DiscreteBasis, static, dynamic=Any[]) =
     _check_projected_symmetry(basis, static, dynamic)
 
@@ -1426,7 +2208,8 @@ normalization(basis::AbstractBasis, state::Integer) = one(Float64)
 get_amp(basis::AbstractBasis, state::Integer) = one(Float64)
 
 function _symmetry_column(data::SymmetryData, state::Integer)
-    row = get(data.parent_lookup, UInt64(state), 0)
+    encoded = convert(eltype(data.parent_states), state)
+    row = get(data.parent_lookup, encoded, 0)
     row == 0 && throw(ArgumentError("state is outside the parent particle sector"))
     columns, values = findnz(data.projector[row, :])
     isempty(columns) &&
@@ -1435,28 +2218,406 @@ function _symmetry_column(data::SymmetryData, state::Integer)
     return columns[position], values[position]
 end
 
-function representative(basis::Union{SpinBasis1D,DiscreteBasis}, state::Integer)
+function representative(
+    basis::Union{SpinBasis1D,WideSpinBasis,DiscreteBasis},
+    state::Integer,
+)
     _has_symmetry(basis.symmetry) || return state
     column, _ = _symmetry_column(basis.symmetry, state)
     return basis.encoded_states[column]
 end
 
-function normalization(basis::Union{SpinBasis1D,DiscreteBasis}, state::Integer)
+function normalization(
+    basis::Union{SpinBasis1D,WideSpinBasis,DiscreteBasis},
+    state::Integer,
+)
     _has_symmetry(basis.symmetry) || return one(Float64)
     _, amplitude = _symmetry_column(basis.symmetry, state)
     return inv(abs2(amplitude))
 end
 
-function get_amp(basis::Union{SpinBasis1D,DiscreteBasis}, state::Integer)
+function get_amp(
+    basis::Union{SpinBasis1D,WideSpinBasis,DiscreteBasis},
+    state::Integer,
+)
     _has_symmetry(basis.symmetry) || return one(Float64)
     _, amplitude = _symmetry_column(basis.symmetry, state)
     return amplitude
 end
 make_basis!(basis::AbstractBasis) = basis
-make_basis_blocks(basis::AbstractBasis) = [1:length(basis)]
-project_to(basis::AbstractBasis, vector::AbstractVecOrMat) =
-    projection_matrix(basis)' * vector
+function make_basis_blocks(
+    basis::AbstractBasis;
+    N_p::Union{Nothing,Integer}=nothing,
+)
+    length(basis) == 0 && return UnitRange{Int}[]
+    applicable(states, basis) || return [1:length(basis)]
+    encoded_states = states(basis)
+    encoded_states isa AbstractVector || return [1:length(basis)]
+    state_values = collect(encoded_states)
+    site_count = hasproperty(basis, :L) ?
+        Int(getproperty(basis, :L)) :
+        hasproperty(basis, :N) ? Int(getproperty(basis, :N)) : 0
+    site_count > 0 || return [1:length(basis)]
+    prefix_bits = N_p === nothing ?
+        clamp(floor(Int, log2(length(state_values) ÷ 2 + 1)), 0, site_count) :
+        clamp(Int(N_p), 0, site_count)
+    prefix_bits == 0 && return [1:length(basis)]
+    shift = site_count - prefix_bits
+    blocks = UnitRange{Int}[]
+    first_index = firstindex(state_values)
+    previous_prefix = state_values[first_index] >> shift
+    for index in (first_index + 1):lastindex(state_values)
+        prefix = state_values[index] >> shift
+        prefix == previous_prefix && continue
+        push!(blocks, first_index:(index - 1))
+        first_index = index
+        previous_prefix = prefix
+    end
+    push!(blocks, first_index:lastindex(state_values))
+    return blocks
+end
+function project_to(
+    basis::AbstractBasis,
+    vector::AbstractVecOrMat;
+    sparse::Bool=true,
+    pcon::Bool=false,
+)
+    projector = pcon ?
+        _pcon_projection_matrix(basis, eltype(vector)) :
+        projection_matrix(basis, eltype(vector); sparse=true)
+    size(vector, 1) == size(projector, 1) ||
+        throw(DimensionMismatch(
+            "the first vector dimension does not match the projection space",
+        ))
+    result = projector' * vector
+    if sparse
+        return SparseArrays.issparse(result) ?
+            result :
+            SparseArrays.sparse(result)
+    end
+    return SparseArrays.issparse(result) ? collect(result) : result
+end
 op_bra_ket(basis::DiscreteBasis, opstring, couplings) =
     operator_matrix(basis, opstring, couplings)
-op_shift_sector(target::AbstractBasis, source::AbstractBasis, operator, vector) =
-    projection_matrix(target)' * projection_matrix(source) * vector
+
+function _spin_full_operator(
+    basis::SpinBasis1D,
+    operator,
+    ::Type{T},
+) where {T<:Number}
+    full_dimension = 1 << basis.L
+    if operator isa AbstractMatrix
+        size(operator) == (full_dimension, full_dimension) ||
+            throw(DimensionMismatch("full operator has the wrong shape"))
+        return Matrix{T}(operator)
+    end
+    is_entry = hasproperty(operator, :op) ||
+        (
+            (operator isa Tuple || operator isa AbstractVector) &&
+            !isempty(operator) &&
+            first(operator) isa AbstractString
+        )
+    entries = is_entry ? (operator,) : operator
+    full_basis = SpinBasis1D(basis.L; pauli=basis.pauli)
+    result = zeros(T, full_dimension, full_dimension)
+    for entry in entries
+        if hasproperty(entry, :op) && hasproperty(entry, :couplings)
+            opstring = String(getproperty(entry, :op))
+            couplings = getproperty(entry, :couplings)
+        elseif (entry isa Tuple || entry isa AbstractVector) && length(entry) == 3
+            opstring = String(entry[1])
+            sites = Tuple(Int.(entry[2]))
+            couplings = [(entry[3], sites...)]
+        elseif (entry isa Tuple || entry isa AbstractVector) && length(entry) == 2
+            opstring = String(entry[1])
+            couplings = entry[2]
+        else
+            throw(ArgumentError(
+                "operator entries must be (opstring, sites, coupling), " *
+                "(opstring, couplings), or objects with op and couplings",
+            ))
+        end
+        result .+= operator_matrix(full_basis, opstring, couplings)
+    end
+    return result
+end
+
+function op_shift_sector(
+    target::SpinBasis1D,
+    source::SpinBasis1D,
+    operator,
+    vector::AbstractVecOrMat;
+    out=nothing,
+)
+    target.L == source.L ||
+        throw(ArgumentError("source and target bases must have the same length"))
+    target.pauli == source.pauli ||
+        throw(ArgumentError("source and target bases must use the same spin convention"))
+    size(vector, 1) == length(source) ||
+        throw(DimensionMismatch("the first vector dimension must equal source Ns"))
+    coefficient_types = Type[eltype(vector)]
+    if !(operator isa AbstractMatrix)
+        entries = (
+            (operator isa Tuple || operator isa AbstractVector) &&
+            !isempty(operator) &&
+            first(operator) isa AbstractString
+        ) ? (operator,) : operator
+        for entry in entries
+            if hasproperty(entry, :couplings)
+                append!(
+                    coefficient_types,
+                    typeof(first(coupling))
+                    for coupling in getproperty(entry, :couplings)
+                )
+            elseif length(entry) == 3
+                push!(coefficient_types, typeof(entry[3]))
+            elseif length(entry) == 2
+                append!(
+                    coefficient_types,
+                    typeof(first(coupling))
+                    for coupling in entry[2]
+                )
+            end
+        end
+    else
+        push!(coefficient_types, eltype(operator))
+    end
+    T = promote_type(ComplexF64, coefficient_types...)
+    full_operator = _spin_full_operator(source, operator, T)
+    source_projector = projection_matrix(source, T; sparse=true)
+    target_projector = projection_matrix(target, T; sparse=true)
+    result = target_projector' * (full_operator * (source_projector * vector))
+    out === nothing && return result
+    axes(out) == axes(result) ||
+        throw(DimensionMismatch("out must have the same axes as the result"))
+    copyto!(out, result)
+    return out
+end
+
+function _normalized_shift_entries(operator)
+    entries = (
+        (operator isa Tuple || operator isa AbstractVector) &&
+        !isempty(operator) &&
+        first(operator) isa AbstractString
+    ) ? (operator,) : operator
+    normalized = Tuple{String,Tuple,Any}[]
+    for entry in entries
+        if hasproperty(entry, :op) && hasproperty(entry, :couplings)
+            opstring = String(getproperty(entry, :op))
+            for coupling in getproperty(entry, :couplings)
+                push!(
+                    normalized,
+                    (opstring, Tuple(coupling[2:end]), first(coupling)),
+                )
+            end
+        elseif (entry isa Tuple || entry isa AbstractVector) &&
+               length(entry) == 3
+            push!(
+                normalized,
+                (
+                    String(entry[1]),
+                    Tuple(Int.(entry[2])),
+                    entry[3],
+                ),
+            )
+        elseif (entry isa Tuple || entry isa AbstractVector) &&
+               length(entry) == 2
+            opstring = String(entry[1])
+            for coupling in entry[2]
+                push!(
+                    normalized,
+                    (opstring, Tuple(coupling[2:end]), first(coupling)),
+                )
+            end
+        else
+            throw(ArgumentError(
+                "operator entries must contain an operator string, sites, and coupling",
+            ))
+        end
+    end
+    return normalized
+end
+
+function _parent_coordinates(symmetry::SymmetryData, vector)
+    return symmetry.reduced ? symmetry.projector * vector : vector
+end
+
+function _reduced_coordinates(symmetry::SymmetryData, vector)
+    return symmetry.reduced ? symmetry.projector' * vector : vector
+end
+
+function op_shift_sector(
+    target::DiscreteBasis{K},
+    source::DiscreteBasis{K},
+    operator,
+    vector::AbstractVecOrMat;
+    out=nothing,
+) where {K}
+    target.L == source.L && target.sps == source.sps ||
+        throw(ArgumentError(
+            "source and target bases must have the same local Hilbert space",
+        ))
+    size(vector, 1) == length(source) ||
+        throw(DimensionMismatch(
+            "the first vector dimension must equal source Ns",
+        ))
+    entries = _normalized_shift_entries(operator)
+    coefficient_types = Type[eltype(vector)]
+    append!(coefficient_types, typeof(entry[3]) for entry in entries)
+    T = promote_type(ComplexF64, coefficient_types...)
+    parent_input = _parent_coordinates(source.symmetry, vector)
+    input_matrix = parent_input isa AbstractVector ?
+        reshape(parent_input, :, 1) :
+        parent_input
+    parent_output = zeros(
+        T,
+        length(target.symmetry.parent_states),
+        size(input_matrix, 2),
+    )
+    source_parent = _discrete_parent_basis(source)
+    weights = UInt64[
+        UInt64(source.sps)^(site - 1) for site in 1:source.L
+    ]
+    for (opstring, sites, coupling) in entries
+        actions = _operator_actions(source_parent, opstring, sites)
+        for (column, initial_state) in
+            pairs(source.symmetry.parent_states)
+            amplitude = complex(coupling)
+            encoded = initial_state
+            alive = true
+            for (op, site, species) in Iterators.reverse(actions)
+                encoded, factor, alive =
+                    _apply_discrete_encoded_local(
+                        source_parent,
+                        encoded,
+                        op,
+                        site,
+                        species,
+                        weights[site],
+                        weights,
+                    )
+                alive || break
+                amplitude *= factor
+            end
+            alive || continue
+            row = get(target.symmetry.parent_lookup, encoded, 0)
+            row == 0 && continue
+            @views parent_output[row, :] .+=
+                amplitude .* input_matrix[column, :]
+        end
+    end
+    result = _reduced_coordinates(target.symmetry, parent_output)
+    vector isa AbstractVector && (result = vec(result))
+    out === nothing && return result
+    axes(out) == axes(result) ||
+        throw(DimensionMismatch(
+            "out must have the same axes as the result",
+        ))
+    copyto!(out, result)
+    return out
+end
+
+function op_shift_sector(
+    target::AbstractBasis,
+    source::AbstractBasis,
+    operator,
+    vector::AbstractVecOrMat;
+    out=nothing,
+)
+    throw(ArgumentError(
+        "cross-sector operator application is not implemented for " *
+        "$(typeof(target)) and $(typeof(source))",
+    ))
+end
+
+function op_bra_ket(
+    basis::SpinBasis1D,
+    opstring::AbstractString,
+    sites,
+    coupling::Number,
+    ::Type{T},
+    ket_states;
+    reduce_output::Bool=true,
+) where {T<:Number}
+    length(opstring) == length(sites) ||
+        throw(ArgumentError("operator arity and sites differ"))
+    kets = ket_states isa Integer ?
+        UInt64[ket_states] :
+        UInt64.(collect(ket_states))
+    matrix_elements = zeros(T, length(kets))
+    bras = similar(kets)
+    for (position, ket) in pairs(kets)
+        ket < (UInt64(1) << basis.L) ||
+            throw(ArgumentError("ket state lies outside the full Hilbert space"))
+        state = ket
+        amplitude = complex(coupling)
+        alive = true
+        for index in length(opstring):-1:1
+            state, factor, alive = _apply_spin_local(
+                basis,
+                state,
+                opstring[index],
+                Int(sites[index]),
+            )
+            alive || break
+            amplitude *= factor
+        end
+        bras[position] = state
+        if alive
+            matrix_elements[position] = convert(T, amplitude)
+        end
+    end
+    reduce_output || return matrix_elements, bras, kets
+    keep = .!iszero.(matrix_elements)
+    return matrix_elements[keep], bras[keep], kets[keep]
+end
+
+function op_bra_ket(
+    basis::DiscreteBasis,
+    opstring::AbstractString,
+    sites,
+    coupling::Number,
+    ::Type{T},
+    ket_states;
+    reduce_output::Bool=true,
+) where {T<:Number}
+    length(opstring) == length(sites) ||
+        throw(ArgumentError("operator arity and sites differ"))
+    actions = _operator_actions(basis, opstring, sites)
+    weights = UInt64[
+        UInt64(basis.sps)^(site - 1) for site in 1:basis.L
+    ]
+    kets = ket_states isa Integer ?
+        UInt64[ket_states] :
+        UInt64.(collect(ket_states))
+    matrix_elements = zeros(T, length(kets))
+    bras = similar(kets)
+    for (position, ket) in pairs(kets)
+        ket < UInt64(basis.sps)^basis.L ||
+            throw(ArgumentError("ket state lies outside the full Hilbert space"))
+        encoded = ket
+        amplitude = complex(coupling)
+        alive = true
+        for (op, site, species) in Iterators.reverse(actions)
+            encoded, factor, alive =
+                _apply_discrete_encoded_local(
+                    basis,
+                    encoded,
+                    op,
+                    site,
+                    species,
+                    weights[site],
+                    weights,
+                )
+            alive || break
+            amplitude *= factor
+        end
+        bras[position] = encoded
+        if alive
+            matrix_elements[position] = convert(T, amplitude)
+        end
+    end
+    reduce_output || return matrix_elements, bras, kets
+    keep = .!iszero.(matrix_elements)
+    return matrix_elements[keep], bras[keep], kets[keep]
+end

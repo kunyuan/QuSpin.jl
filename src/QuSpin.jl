@@ -12,6 +12,7 @@ using .Basis:
     BosonBasis1D,
     BosonBasisGeneral,
     FixedUInt,
+    HOBasis,
     PhotonBasis,
     SpinBasis1D,
     SpinBasisGeneral,
@@ -50,6 +51,7 @@ using .Basis:
     check_symm,
     get_amp,
     inplace_op!,
+    isbasis,
     make_basis!,
     make_basis_blocks,
     normalization,
@@ -138,6 +140,7 @@ using .Tools:
 export Basis, Operators, Tools
 export DIAMatrix, SparseMatrixCSR
 export AbstractBasis, ExpOp, FixedUInt, Hamiltonian, OperatorTerm
+export HOBasis, isbasis
 export BosonBasis1D, BosonBasisGeneral
 export PhotonBasis, TensorBasis
 export UserBasis

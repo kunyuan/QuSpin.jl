@@ -308,6 +308,42 @@ Compatibility entry point for QuSpin's deprecated measurements helper. New
 Julia code should prefer `ent_entropy(basis, system_state; ...)`.
 """
 function ent_entropy(
+    system_state::AbstractDict,
+    basis::AbstractBasis;
+    kwargs...,
+)
+    state = if haskey(system_state, "V_states") ||
+               haskey(system_state, :V_states)
+        get(system_state, "V_states", get(system_state, :V_states, nothing))
+    elseif (
+        haskey(system_state, "V_rho") ||
+        haskey(system_state, :V_rho)
+    ) && (
+        haskey(system_state, "rho_d") ||
+        haskey(system_state, :rho_d)
+    )
+        vectors =
+            get(system_state, "V_rho", get(system_state, :V_rho, nothing))
+        probabilities =
+            get(system_state, "rho_d", get(system_state, :rho_d, nothing))
+        vectors * Diagonal(probabilities) * vectors'
+    else
+        throw(ArgumentError(
+            "state dictionary requires V_states or both V_rho and rho_d",
+        ))
+    end
+    return ent_entropy(
+        state,
+        basis;
+        enforce_pure=(
+            haskey(system_state, "V_states") ||
+            haskey(system_state, :V_states)
+        ),
+        kwargs...,
+    )
+end
+
+function ent_entropy(
     system_state::AbstractVecOrMat,
     basis::AbstractBasis;
     chain_subsys=nothing,
@@ -517,12 +553,25 @@ function obs_vs_time(
             for (key, value) in Sent_args
             if key ∉ (:basis, "basis")
         )
-        ndims(states) == 2 ||
-            throw(ArgumentError("time-resolved entropy currently requires pure states"))
-        entropy_rows = [
-            ent_entropy(basis, @view(states[:, index]); entropy_kwargs...)
-            for index in axes(states, 2)
-        ]
+        entropy_rows = if ndims(states) == 2
+            [
+                ent_entropy(
+                    basis,
+                    @view(states[:, index]);
+                    entropy_kwargs...,
+                )
+                for index in axes(states, 2)
+            ]
+        else
+            [
+                ent_entropy(
+                    basis,
+                    @view(states[:, :, index]);
+                    entropy_kwargs...,
+                )
+                for index in axes(states, 3)
+            ]
+        end
         entropy_keys = keys(first(entropy_rows))
         results["Sent_time"] = Dict(
             key => [entry[key] for entry in entropy_rows]
@@ -1121,6 +1170,22 @@ function _rk45_iterator(
     )
 end
 
+function _stacked_real_initial(state::AbstractArray)
+    flattened = vec(state)
+    R = typeof(real(zero(eltype(flattened))))
+    return R[real.(flattened)...; imag.(flattened)...]
+end
+
+function _unstack_complex_state(state::AbstractVector, shape)
+    iseven(length(state)) ||
+        throw(DimensionMismatch("stacked real state must have even length"))
+    count = length(state) ÷ 2
+    complex_state =
+        complex.(@view(state[1:count]), @view(state[(count + 1):end]))
+    restored = reshape(complex_state, shape)
+    return length(shape) == 1 ? vec(restored) : restored
+end
+
 function evolve(
     v0::AbstractArray,
     t0::Real,
@@ -1138,17 +1203,63 @@ function evolve(
 )
     max_step > 0 || throw(ArgumentError("max_step must be positive"))
     solver = Symbol(lowercase(String(solver_name)))
-    solver in (:rk4, :dop853, :dopri5, :rk45) ||
+    solver in (
+        :rk4,
+        :dop853,
+        :dopri5,
+        :rk45,
+        :vode,
+        :zvode,
+        :lsoda,
+    ) ||
         throw(ArgumentError(
-            "solver_name must be :dop853, :dopri5, :rk45, or :rk4",
+            "unsupported ODE solver name",
         ))
-    stack_state &&
-        throw(ArgumentError("stack_state is not supported by the native ODE solver"))
+    if stack_state
+        imag_time && throw(ArgumentError(
+            "imag_time is incompatible with stack_state",
+        ))
+        internal = evolve(
+            _stacked_real_initial(v0),
+            t0,
+            times,
+            f;
+            solver_name=solver,
+            real=true,
+            stack_state=false,
+            verbose,
+            imag_time=false,
+            iterate,
+            f_params,
+            max_step,
+            kwargs...,
+        )
+        if iterate
+            return (
+                _unstack_complex_state(state, size(v0))
+                for state in internal
+            )
+        end
+        if times isa Number
+            return _unstack_complex_state(internal, size(v0))
+        end
+        restored = [
+            _unstack_complex_state(
+                @view(internal[:, index]),
+                size(v0),
+            )
+            for index in axes(internal, 2)
+        ]
+        return v0 isa AbstractVector ?
+            reduce(hcat, restored) :
+            cat(restored...; dims=ndims(v0) + 1)
+    end
     supported_keywords = solver === :rk4 ? () : (:rtol, :atol, :tol)
     unsupported = setdiff(keys(kwargs), supported_keywords)
     isempty(unsupported) ||
         throw(ArgumentError("unsupported ODE solver keyword(s): $unsupported"))
-    targets = collect(times)
+    scalar_target = times isa Number
+    targets = scalar_target ? [times] : collect(times)
     isempty(targets) && throw(ArgumentError("times must be nonempty"))
     issorted(targets) || throw(ArgumentError("times must be sorted"))
     targets[1] >= t0 ||
@@ -1186,6 +1297,7 @@ function evolve(
     end
     iterate && return iterator
     outputs = collect(iterator)
+    scalar_target && return first(outputs)
     first(outputs) isa AbstractVector && return reduce(hcat, outputs)
     return cat(outputs...; dims=ndims(first(outputs)) + 1)
 end
@@ -1691,6 +1803,77 @@ function _normalize_block_terms(static)
     ]
 end
 
+struct _BlockDiagonalBasis <: AbstractBasis
+    dimension::Int
+end
+
+Base.length(basis::_BlockDiagonalBasis) = basis.dimension
+
+function _normalize_block_dynamic(basis, dynamic, dtype::Type)
+    isempty(dynamic) && return Any[]
+    reduced_dimension = length(basis)
+    projector = nothing
+    normalized = Any[]
+    for entry in dynamic
+        (entry isa Tuple || entry isa AbstractVector) ||
+            throw(ArgumentError("dynamic entries must be tuples or vectors"))
+        if first(entry) isa AbstractMatrix
+            length(entry) == 3 ||
+                throw(ArgumentError(
+                    "dynamic matrix entries are [matrix, f, f_args]",
+                ))
+            matrix, function_value, arguments = entry
+            reduced_matrix = if size(matrix) ==
+                                (reduced_dimension, reduced_dimension)
+                matrix
+            else
+                projector === nothing &&
+                    (projector = projection_matrix(
+                        basis,
+                        dtype;
+                        sparse=true,
+                    ))
+                size(matrix) == (size(projector, 1), size(projector, 1)) ||
+                    throw(DimensionMismatch(
+                        "dynamic matrix must act in the block or parent basis",
+                    ))
+                projector' * matrix * projector
+            end
+            push!(normalized, Any[reduced_matrix, function_value, arguments])
+        else
+            length(entry) == 4 ||
+                throw(ArgumentError(
+                    "dynamic operator entries are [op, couplings, f, f_args]",
+                ))
+            push!(normalized, entry)
+        end
+    end
+    return normalized
+end
+
+function _construct_block_hamiltonian(
+    basis,
+    static,
+    dynamic,
+    dtype::Type;
+    check_symm::Bool,
+    check_herm::Bool,
+    check_pcon::Bool,
+)
+    normalized_dynamic = _normalize_block_dynamic(basis, dynamic, dtype)
+    return Hamiltonian(
+        static,
+        normalized_dynamic;
+        basis,
+        dtype,
+        static_fmt=:csc,
+        dynamic_fmt=:csc,
+        check_symm,
+        check_herm,
+        check_pcon,
+    )
+end
+
 function _block_keywords(values)
     keywords = Dict{Symbol,Any}()
     for (key, value) in values
@@ -1748,35 +1931,80 @@ function block_diag_hamiltonian(
     check_herm::Bool=true,
     check_pcon::Bool=true,
 )
-    isempty(dynamic) ||
-        throw(ArgumentError("dynamic block Hamiltonians are not yet supported"))
     terms = _normalize_block_terms(static)
     bases = [
         _construct_block_basis(basis_con, basis_args, basis_kwargs, block)
         for block in blocks
     ]
     hamiltonians = [
-        Hamiltonian(
+        _construct_block_hamiltonian(
             basis,
-            terms;
-            static_fmt=:csc,
+            terms,
+            dynamic,
+            dtype;
             check_symm,
             check_herm,
             check_pcon,
         )
         for basis in bases
     ]
-    matrix = _sparse_block_diagonal(
-        (tocsc(hamiltonian) for hamiltonian in hamiltonians),
+    static_matrix = _sparse_block_diagonal(
+        (hamiltonian.data for hamiltonian in hamiltonians),
         dtype,
     )
-    get_proj || return matrix
+    result = if isempty(dynamic)
+        static_matrix
+    else
+        dynamic_entries = Any[]
+        dynamic_count = length(first(hamiltonians).dynamic_terms)
+        all(
+            length(hamiltonian.dynamic_terms) == dynamic_count
+            for hamiltonian in hamiltonians
+        ) || throw(ArgumentError(
+            "each symmetry block must contain the same dynamic terms",
+        ))
+        for index in 1:dynamic_count
+            matrices = [
+                hamiltonian.dynamic_terms[index][1]
+                for hamiltonian in hamiltonians
+            ]
+            function_value = hamiltonians[1].dynamic_terms[index][2]
+            arguments = hamiltonians[1].dynamic_terms[index][3]
+            all(
+                hamiltonian.dynamic_terms[index][2] === function_value &&
+                hamiltonian.dynamic_terms[index][3] == arguments
+                for hamiltonian in hamiltonians
+            ) || throw(ArgumentError(
+                "dynamic terms must have a consistent order across blocks",
+            ))
+            push!(
+                dynamic_entries,
+                Any[
+                    _sparse_block_diagonal(matrices, dtype),
+                    function_value,
+                    arguments,
+                ],
+            )
+        end
+        Hamiltonian(
+            Any[static_matrix],
+            dynamic_entries;
+            basis=_BlockDiagonalBasis(size(static_matrix, 1)),
+            dtype,
+            static_fmt=:csc,
+            dynamic_fmt=:csc,
+            check_symm=false,
+            check_herm=false,
+            check_pcon=false,
+        )
+    end
+    get_proj || return result
     sparse_projectors = _block_projector_sparse(get_proj_kwargs)
     projectors = [
         projection_matrix(basis, dtype; sparse=sparse_projectors)
         for basis in bases
     ]
-    return hcat(projectors...), matrix
+    return hcat(projectors...), result
 end
 
 mutable struct BlockOps
@@ -1788,6 +2016,7 @@ mutable struct BlockOps
     dynamic::Vector{Any}
     save_previous_data::Bool
     sparse_projectors::Bool
+    basis_kwargs::Dict{Any,Any}
     check_symm::Bool
     check_herm::Bool
     check_pcon::Bool
@@ -1808,8 +2037,6 @@ function BlockOps(
     check_herm::Bool=true,
     check_pcon::Bool=true,
 )
-    isempty(dynamic) ||
-        throw(ArgumentError("dynamic block Hamiltonians are not yet supported"))
     bases = Dict{String,Any}()
     for block in blocks
         basis = _construct_block_basis(basis_con, basis_args, basis_kwargs, block)
@@ -1824,6 +2051,7 @@ function BlockOps(
         Any[dynamic...],
         save_previous_data || compute_all_blocks,
         _block_projector_sparse(get_proj_kwargs),
+        Dict{Any,Any}(basis_kwargs),
         check_symm,
         check_herm,
         check_pcon,
@@ -1842,10 +2070,11 @@ function compute_all_blocks!(operator::BlockOps)
                     sparse=operator.sparse_projectors,
                 ))
         haskey(operator.H_dict, key) ||
-            (operator.H_dict[key] = Hamiltonian(
+            (operator.H_dict[key] = _construct_block_hamiltonian(
                 basis,
-                operator.static;
-                static_fmt=:csc,
+                operator.static,
+                operator.dynamic,
+                operator.dtype;
                 check_symm=operator.check_symm,
                 check_herm=operator.check_herm,
                 check_pcon=operator.check_pcon,
@@ -1864,7 +2093,12 @@ function update_blocks!(
     for block in blocks
         key = repr(block)
         haskey(operator.basis_dict, key) && continue
-        basis = _construct_block_basis(basis_con, basis_args, Dict(), block)
+        basis = _construct_block_basis(
+            basis_con,
+            basis_args,
+            operator.basis_kwargs,
+            block,
+        )
         length(basis) > 0 && (operator.basis_dict[key] = basis)
     end
     compute_all_blocks && compute_all_blocks!(operator)
@@ -1879,10 +2113,11 @@ function _block_data(operator::BlockOps, key, basis)
                 operator.dtype;
                 sparse=operator.sparse_projectors,
             ),
-            Hamiltonian(
+            _construct_block_hamiltonian(
                 basis,
-                operator.static;
-                static_fmt=:csc,
+                operator.static,
+                operator.dynamic,
+                operator.dtype;
                 check_symm=operator.check_symm,
                 check_herm=operator.check_herm,
                 check_pcon=operator.check_pcon,
@@ -1899,10 +2134,11 @@ function _block_data(operator::BlockOps, key, basis)
         key,
     )
     hamiltonian = get!(
-        () -> Hamiltonian(
+        () -> _construct_block_hamiltonian(
             basis,
-            operator.static;
-            static_fmt=:csc,
+            operator.static,
+            operator.dynamic,
+            operator.dtype;
             check_symm=operator.check_symm,
             check_herm=operator.check_herm,
             check_pcon=operator.check_pcon,
@@ -1918,19 +2154,25 @@ function _active_block_entries(
     psi_0::AbstractVector;
     H_time_eval::Real=0.0,
     shift=nothing,
+    freeze_dynamic::Bool=false,
 )
     entries = Any[]
     for (key, basis) in operator.basis_dict
         projector, hamiltonian = _block_data(operator, key, basis)
         projected = projector' * psi_0
         norm(projected) > 1000eps(Float64) || continue
-        generator = if shift === nothing
+        generator = if shift === nothing && !freeze_dynamic
             hamiltonian
         else
             matrix = tocsc(hamiltonian; time=H_time_eval)
-            matrix + spdiagm(
-                0 => fill(convert(eltype(matrix), shift), size(matrix, 1)),
-            )
+            shift === nothing ?
+                matrix :
+                matrix + spdiagm(
+                    0 => fill(
+                        convert(eltype(matrix), shift),
+                        size(matrix, 1),
+                    ),
+                )
         end
         push!(entries, (projector, generator, projected))
     end
@@ -2056,6 +2298,39 @@ function _block_evolution(
     return result
 end
 
+function _dynamic_block_evolution(
+    entries,
+    t0::Real,
+    targets,
+    dimension::Int,
+    output_type::Type{T};
+    iterate::Bool=false,
+    n_jobs::Integer=1,
+    imag_time::Bool=false,
+    kwargs...,
+) where {T<:Number}
+    block_states = Vector{Any}(undef, length(entries))
+    _parallel_for(length(entries), n_jobs) do index
+        projector, hamiltonian, initial = entries[index]
+        block_states[index] = evolve(
+            hamiltonian,
+            initial,
+            t0,
+            targets;
+            iterate=false,
+            imag_time,
+            kwargs...,
+        )
+    end
+    result = zeros(output_type, dimension, length(targets))
+    for (entry, states) in zip(entries, block_states)
+        _accumulate_projection!(result, entry[1], states)
+    end
+    iterate &&
+        return (copy(@view(result[:, index])) for index in axes(result, 2))
+    return result
+end
+
 function evolve(
     operator::BlockOps,
     psi_0::AbstractVector,
@@ -2068,17 +2343,33 @@ function evolve(
     imag_time::Bool=false,
     kwargs...,
 )
-    imag_time && throw(ArgumentError("imaginary-time block evolution is unsupported"))
-    stack_state && throw(ArgumentError("stack_state is unsupported for block evolution"))
     n_jobs > 0 || throw(ArgumentError("n_jobs must be positive"))
+    scalar_target = times isa Number
+    targets = scalar_target ? [times] : collect(times)
+    entries = _active_block_entries(operator, psi_0)
+    output_type = promote_type(ComplexF64, eltype(psi_0))
+    if !isempty(operator.dynamic)
+        output = _dynamic_block_evolution(
+            entries,
+            t0,
+            targets,
+            length(psi_0),
+            output_type;
+            iterate,
+            n_jobs,
+            imag_time,
+            kwargs...,
+        )
+        iterate && return output
+        return scalar_target ? copy(@view(output[:, 1])) : output
+    end
     unsupported = setdiff(keys(kwargs), (:tol, :krylov_dim))
     isempty(unsupported) ||
         throw(ArgumentError("unsupported block evolution keyword(s): $unsupported"))
-    targets = collect(times)
-    scales = ComplexF64[-im * (time - t0) for time in targets]
-    entries = _active_block_entries(operator, psi_0)
-    output_type = promote_type(ComplexF64, eltype(psi_0))
-    return _block_evolution(
+    scales = imag_time ?
+        ComplexF64[-(time - t0) for time in targets] :
+        ComplexF64[-im * (time - t0) for time in targets]
+    output = _block_evolution(
         entries,
         scales,
         length(psi_0),
@@ -2089,6 +2380,8 @@ function evolve(
         tol=get(kwargs, :tol, 1e-12),
         krylov_dim=get(kwargs, :krylov_dim, 30),
     )
+    iterate && return output
+    return scalar_target ? copy(@view(output[:, 1])) : output
 end
 
 function block_expm(
@@ -2115,6 +2408,7 @@ function block_expm(
         psi_0;
         H_time_eval,
         shift,
+        freeze_dynamic=true,
     )
     output_type = promote_type(ComplexF64, eltype(psi_0), typeof(a))
     output = _block_evolution(
