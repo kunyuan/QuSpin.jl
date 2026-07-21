@@ -86,6 +86,39 @@ using QuSpin
             ) atol=3e-11
         end
 
+        static_H = Hamiltonian(
+            Any[0.3Z + 0.7X],
+            Any[];
+            basis,
+            dtype=ComplexF64,
+            check_herm=false,
+            check_symm=false,
+            check_pcon=false,
+        )
+        static_batch = evolve(static_H, batch, 0.0, times; eom=:SE)
+        @test size(static_batch) == (2, 3, 3)
+        for column in axes(batch, 2)
+            @test static_batch[:, column, :] ≈ evolve(
+                static_H,
+                batch[:, column],
+                0.0,
+                times;
+                eom=:SE,
+            ) atol=3e-12
+        end
+        @test evolve(static_H, batch, 0.0, 0.2; eom=:SE) ≈
+            static_batch[:, :, 2] atol=3e-12
+        @test collect(evolve(
+            static_H,
+            batch,
+            0.0,
+            times;
+            eom=:SE,
+            iterate=true,
+        )) ≈ [static_batch[:, :, index] for index in axes(static_batch, 3)]
+        @test size(evolve(static_H, batch, 0.0, Float64[]; eom=:SE)) ==
+            (2, 3, 0)
+
         rho0 = ComplexF64[1 0; 0 0]
         rho_t = evolve(
             H,
