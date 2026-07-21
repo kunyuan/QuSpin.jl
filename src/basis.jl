@@ -1,3 +1,7 @@
+"""
+Basis construction, state encoding, symmetry reduction, projection, and
+entanglement utilities used by `QuSpin`.
+"""
 module Basis
 
 using LinearAlgebra
@@ -22,6 +26,12 @@ export get_amp, make_basis!, make_basis_blocks, normalization
 export op_bra_ket, op_shift_sector, project_to, representative
 export isbasis
 
+"""
+    AbstractBasis
+
+Abstract supertype for every QuSpin basis. Concrete bases define state
+enumeration, indexing, projection, and local-operator actions.
+"""
 abstract type AbstractBasis end
 
 isbasis(value) = value isa AbstractBasis

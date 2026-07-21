@@ -1,3 +1,7 @@
+"""
+Numerical helpers for measurements, Lanczos methods, Floquet calculations,
+block operations, and matrix-exponential actions.
+"""
 module Tools
 
 using LinearAlgebra

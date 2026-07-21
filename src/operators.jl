@@ -1,3 +1,7 @@
+"""
+Hamiltonians, parameterized and matrix-free operators, sparse storage adapters,
+eigensolvers, evolution, and persistence for `QuSpin`.
+"""
 module Operators
 
 using Arpack

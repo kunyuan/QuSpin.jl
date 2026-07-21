@@ -1,0 +1,8 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+QuSpin = "f4e3560f-74d4-4f58-a6e7-e2fc1eaf7c48"
+
+[compat]
+Documenter = "1"
+QuSpin = "0.1"
+julia = "1.10"

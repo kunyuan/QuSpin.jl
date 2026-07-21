@@ -1,3 +1,16 @@
+"""
+    QuSpin
+
+A Julia-native exact-diagonalization toolkit for constructing symmetry-aware
+many-body bases, Hamiltonians, matrix-free operators, Krylov evolutions, and
+measurements. The API follows the documented QuSpin 1.0.1 public surface while
+using Julia conventions such as one-based lattice sites and `!` suffixes for
+mutating operations.
+
+The public API is organized into [`QuSpin.Basis`](@ref),
+[`QuSpin.Operators`](@ref), and [`QuSpin.Tools`](@ref), and is also re-exported
+from the top-level module for interactive use.
+"""
 module QuSpin
 
 using LinearAlgebra
@@ -179,5 +192,7 @@ export ed_state_vs_time, expm_lanczos, lanczos_full, lanczos_iter, lin_comb_Q_T
 export ftlm_static_iteration, ltlm_static_iteration
 export eigvals, state_at, state_index, states
 export int_to_state, state_to_int
+
+include("public_api_docs.jl")
 
 end

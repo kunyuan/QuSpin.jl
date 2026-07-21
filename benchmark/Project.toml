@@ -1,0 +1,8 @@
+[deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+QuSpin = "f4e3560f-74d4-4f58-a6e7-e2fc1eaf7c48"
+
+[compat]
+BenchmarkTools = "1"
+QuSpin = "0.1"
+julia = "1.10"
