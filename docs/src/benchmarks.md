@@ -24,9 +24,10 @@ allocations; never compare first-call Julia timings against warmed Python calls.
 
 ## Current same-runner snapshot
 
-The following warm medians came from verification run
-[29800995942](https://github.com/kunyuan/quspin-julia-verify/actions/runs/29800995942)
-on one Julia and BLAS thread. Speedup is Python median divided by Julia median.
+The following warm medians came from private verification run `29800995942`
+on one Julia and BLAS thread. The run is intentionally access-controlled; its
+raw CSV artifacts and logs remain in the private Matrix Lab verification
+repository. Speedup is Python median divided by Julia median.
 
 | Workload | Python (ms) | Julia (ms) | Julia speedup |
 | --- | ---: | ---: | ---: |
