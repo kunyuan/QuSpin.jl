@@ -1,3 +1,11 @@
+const _StructuredMatrixRHS = Union{
+    Bidiagonal,
+    Diagonal,
+    SymTridiagonal,
+    Tridiagonal,
+    LinearAlgebra.AbstractTriangular,
+}
+
 """
     SparseMatrixCSR(matrix)
 
@@ -166,6 +174,8 @@ Base.:*(matrix::SparseMatrixCSR{T}, value::AbstractVector{S}) where {T,S} =
     _csr_mul(matrix, value)
 Base.:*(matrix::SparseMatrixCSR{T}, value::AbstractMatrix{S}) where {T,S} =
     _csr_mul(matrix, value)
+Base.:*(matrix::SparseMatrixCSR, value::_StructuredMatrixRHS) =
+    _csr_mul(matrix, value)
 LinearAlgebra.mul!(
     result::AbstractVector,
     matrix::SparseMatrixCSR,
@@ -175,6 +185,11 @@ LinearAlgebra.mul!(
     result::AbstractMatrix,
     matrix::SparseMatrixCSR,
     value::AbstractMatrix,
+) = _csr_mul!(result, matrix, value, true, false)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::SparseMatrixCSR,
+    value::_StructuredMatrixRHS,
 ) = _csr_mul!(result, matrix, value, true, false)
 LinearAlgebra.mul!(
     result::AbstractVector,
@@ -187,6 +202,13 @@ LinearAlgebra.mul!(
     result::AbstractMatrix,
     matrix::SparseMatrixCSR,
     value::AbstractMatrix,
+    alpha::Number,
+    beta::Number,
+) = _csr_mul!(result, matrix, value, alpha, beta)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::SparseMatrixCSR,
+    value::_StructuredMatrixRHS,
     alpha::Number,
     beta::Number,
 ) = _csr_mul!(result, matrix, value, alpha, beta)
@@ -391,6 +413,8 @@ Base.:*(matrix::DIAMatrix{T}, value::AbstractVector{S}) where {T,S} =
     _dia_mul(matrix, value)
 Base.:*(matrix::DIAMatrix{T}, value::AbstractMatrix{S}) where {T,S} =
     _dia_mul(matrix, value)
+Base.:*(matrix::DIAMatrix, value::_StructuredMatrixRHS) =
+    _dia_mul(matrix, value)
 LinearAlgebra.mul!(
     result::AbstractVector,
     matrix::DIAMatrix,
@@ -400,6 +424,11 @@ LinearAlgebra.mul!(
     result::AbstractMatrix,
     matrix::DIAMatrix,
     value::AbstractMatrix,
+) = _dia_mul!(result, matrix, value, true, false)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::DIAMatrix,
+    value::_StructuredMatrixRHS,
 ) = _dia_mul!(result, matrix, value, true, false)
 LinearAlgebra.mul!(
     result::AbstractVector,
@@ -412,6 +441,13 @@ LinearAlgebra.mul!(
     result::AbstractMatrix,
     matrix::DIAMatrix,
     value::AbstractMatrix,
+    alpha::Number,
+    beta::Number,
+) = _dia_mul!(result, matrix, value, alpha, beta)
+LinearAlgebra.mul!(
+    result::AbstractMatrix,
+    matrix::DIAMatrix,
+    value::_StructuredMatrixRHS,
     alpha::Number,
     beta::Number,
 ) = _dia_mul!(result, matrix, value, alpha, beta)

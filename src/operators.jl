@@ -1104,6 +1104,40 @@ function Base.:*(
     )
     return mul!(output, operator, value)
 end
+function Base.:*(
+    operator::ActionLinearOperator{T},
+    value::_StructuredMatrixRHS,
+) where {T}
+    output = zeros(
+        promote_type(T, eltype(value)),
+        size(operator, 1),
+        size(value, 2),
+    )
+    return mul!(output, operator, value)
+end
+function LinearAlgebra.mul!(
+    output::AbstractMatrix,
+    operator::ActionLinearOperator,
+    value::_StructuredMatrixRHS,
+    alpha::Number=true,
+    beta::Number=false,
+)
+    return invoke(
+        mul!,
+        Tuple{
+            AbstractMatrix,
+            ActionLinearOperator,
+            AbstractMatrix,
+            Number,
+            Number,
+        },
+        output,
+        operator,
+        value,
+        alpha,
+        beta,
+    )
+end
 function Base.getindex(operator::ActionLinearOperator{T}, row::Int, column::Int) where {T}
     input = zeros(T, operator.n)
     input[column] = one(T)
@@ -2957,6 +2991,8 @@ Base.:*(
     operator::QuantumLinearOperator{T},
     value::AbstractMatrix{S},
 ) where {T,S} = _apply_linear(operator, value)
+Base.:*(operator::QuantumLinearOperator, value::_StructuredMatrixRHS) =
+    _apply_linear(operator, value)
 LinearAlgebra.mul!(
     output::AbstractVector,
     operator::QuantumLinearOperator,
@@ -3024,6 +3060,34 @@ function LinearAlgebra.mul!(
     end
     return output
 end
+function LinearAlgebra.mul!(
+    output::AbstractMatrix,
+    operator::QuantumLinearOperator,
+    value::_StructuredMatrixRHS,
+    alpha::Number,
+    beta::Number,
+)
+    return invoke(
+        mul!,
+        Tuple{
+            AbstractMatrix,
+            QuantumLinearOperator,
+            AbstractMatrix,
+            Number,
+            Number,
+        },
+        output,
+        operator,
+        value,
+        alpha,
+        beta,
+    )
+end
+LinearAlgebra.mul!(
+    output::AbstractMatrix,
+    operator::QuantumLinearOperator,
+    value::_StructuredMatrixRHS,
+) = mul!(output, operator, value, true, false)
 LinearAlgebra.ishermitian(operator::QuantumLinearOperator) = operator.hermitian
 LinearAlgebra.issymmetric(operator::QuantumLinearOperator) =
     eltype(operator) <: Real && operator.hermitian

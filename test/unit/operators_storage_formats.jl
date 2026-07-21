@@ -37,6 +37,35 @@
     @test dia.data * vector ≈ csc.data * vector atol=2e-14
     @test csr.data * columns ≈ csc.data * columns atol=2e-14
     @test dia.data * columns ≈ csc.data * columns atol=2e-14
+
+    structured_right = (
+        Diagonal(range(0.5, 1.5; length=length(basis))),
+        UpperTriangular(reshape(
+            range(-0.2, 0.4; length=length(basis)^2),
+            length(basis),
+            length(basis),
+        )),
+    )
+    for right in structured_right
+        expected_product = csc.data * Matrix(right)
+        @test csr.data * right ≈ expected_product atol=2e-14
+        @test dia.data * right ≈ expected_product atol=2e-14
+
+        csr_output = similar(expected_product)
+        dia_output = similar(expected_product)
+        mul!(csr_output, csr.data, right)
+        mul!(dia_output, dia.data, right)
+        @test csr_output ≈ expected_product atol=2e-14
+        @test dia_output ≈ expected_product atol=2e-14
+
+        fill!(csr_output, 0.25)
+        fill!(dia_output, 0.25)
+        mul!(csr_output, csr.data, right, 0.7, -0.3)
+        mul!(dia_output, dia.data, right, 0.7, -0.3)
+        expected_scaled = 0.7expected_product .- 0.075
+        @test csr_output ≈ expected_scaled atol=2e-14
+        @test dia_output ≈ expected_scaled atol=2e-14
+    end
     @test Matrix(adjoint(csr.data)) == Matrix(adjoint(csc.data))
     @test Matrix(transpose(dia.data)) == Matrix(transpose(csc.data))
 

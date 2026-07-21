@@ -858,6 +858,13 @@ end
 
     vector = normalize(ComplexF64[1, 2im, -0.5])
     @test operator * vector ≈ matrix * vector atol=3e-16
+    structured_vectors = Diagonal(ComplexF64[1, 0.5im, -0.25])
+    @test operator * structured_vectors ≈
+        matrix * Matrix(structured_vectors) atol=3e-16
+    structured_output = zeros(ComplexF64, 3, 3)
+    mul!(structured_output, operator, structured_vectors)
+    @test structured_output ≈
+        matrix * Matrix(structured_vectors) atol=3e-16
     destination = ComplexF64[0.25, -0.5im, 0.75]
     original_destination = copy(destination)
     @test mul!(destination, operator, vector, 1.25, -0.5) === destination
