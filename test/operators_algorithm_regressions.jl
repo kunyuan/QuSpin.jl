@@ -63,6 +63,35 @@ end
         @test apply(qlo, vector; out=similar(vector)) ≈ reference * vector
         @test mul!(output, qlo, rhs) ≈ reference * rhs
         @test eltype(output) === ComplexF64
+        dimension = length(basis)
+        diagonal = collect(range(0.4, 1.1; length=dimension))
+        off_diagonal = collect(range(-0.15, 0.2; length=dimension - 1))
+        structured_right = (
+            Bidiagonal(diagonal, off_diagonal, :U),
+            Diagonal(diagonal),
+            SymTridiagonal(diagonal, off_diagonal),
+            Tridiagonal(off_diagonal, diagonal, reverse(off_diagonal)),
+            UpperTriangular(randn(dimension, dimension)),
+        )
+        action! = (destination, source) ->
+            mul!(destination, reference, source)
+        action_operator = QuSpin.Operators.ActionLinearOperator{
+            eltype(reference),
+            typeof(action!),
+        }(dimension, action!, true)
+        for structured in structured_right
+            expected = reference * Matrix(structured)
+            for operator in (qlo, action_operator)
+                @test operator * structured ≈ expected atol=2e-14
+                structured_output = similar(expected)
+                mul!(structured_output, operator, structured)
+                @test structured_output ≈ expected atol=2e-14
+                fill!(structured_output, 0.25)
+                mul!(structured_output, operator, structured, 0.7, -0.3)
+                @test structured_output ≈
+                    0.7expected .- 0.075 atol=2e-14
+            end
+        end
         vector_bytes, matrix_bytes =
             _qlo_buffer_allocations(qlo, vector, rhs)
         @test vector_bytes <= 512

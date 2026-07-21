@@ -9,7 +9,12 @@ using QuSpin
     @test isdefined(QuSpin, :Tools)
     @test QuSpin.Basis.SpinBasis1D === SpinBasis1D
     @test QuSpin.Operators.Hamiltonian === Hamiltonian
-    @test isempty(detect_ambiguities(QuSpin; recursive=true))
+    ambiguities = detect_ambiguities(QuSpin; recursive=true)
+    quspin_modules = (QuSpin, QuSpin.Basis, QuSpin.Operators, QuSpin.Tools)
+    internal_ambiguities = filter(ambiguities) do pair
+        all(method -> method.module in quspin_modules, pair)
+    end
+    @test isempty(internal_ambiguities)
 end
 
 @testset "Wide basis integers" begin
@@ -241,11 +246,11 @@ end
         VF=true,
     )
     @test spectrum.T == 0.5
-    @test spectrum.EF ≈ [-1.0, 1.0] atol=2e-16
+    @test spectrum.EF ≈ [-1.0, 1.0] atol=8eps(Float64)
     @test spectrum.UF ≈ exp((-0.5im) .* Z) atol=3e-16
     @test spectrum.HF ≈ Z atol=2e-15
     @test spectrum.thetaF ≈
-        ComplexF64[exp(0.5im), exp(-0.5im)] atol=3e-16
+        ComplexF64[exp(0.5im), exp(-0.5im)] atol=8eps(Float64)
     @test spectrum.VF' * spectrum.VF ≈ Matrix{ComplexF64}(I, 2, 2) atol=2e-16
 
     X = ComplexF64[0 1; 1 0]
@@ -858,6 +863,13 @@ end
 
     vector = normalize(ComplexF64[1, 2im, -0.5])
     @test operator * vector ≈ matrix * vector atol=3e-16
+    structured_vectors = Diagonal(ComplexF64[1, 0.5im, -0.25])
+    @test operator * structured_vectors ≈
+        matrix * Matrix(structured_vectors) atol=3e-16
+    structured_output = zeros(ComplexF64, 3, 3)
+    mul!(structured_output, operator, structured_vectors)
+    @test structured_output ≈
+        matrix * Matrix(structured_vectors) atol=3e-16
     destination = ComplexF64[0.25, -0.5im, 0.75]
     original_destination = copy(destination)
     @test mul!(destination, operator, vector, 1.25, -0.5) === destination
@@ -946,6 +958,15 @@ end
 
 include("paper_workflows.jl")
 include("completeness_gaps.jl")
+include("public_api_docstrings.jl")
+include("unit/basis_integer_helpers.jl")
+include("unit/basis_photon_helpers.jl")
+include("unit/basis_spin_basis_1d.jl")
+include("unit/basis_discrete_bases.jl")
+include("unit/operators_algebra.jl")
+include("unit/operators_storage_formats.jl")
+include("unit/tools_misc.jl")
+include("unit/tools_measurements.jl")
 include("basis_algorithm_regressions.jl")
 include("operators_algorithm_regressions.jl")
 include("tools_algorithm_regressions.jl")

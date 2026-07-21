@@ -1,5 +1,10 @@
 # QuSpin.jl
 
+[![CI](https://github.com/kunyuan/QuSpin.jl/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/kunyuan/QuSpin.jl/actions/workflows/test.yml)
+[![Documentation](https://github.com/kunyuan/QuSpin.jl/actions/workflows/docs.yml/badge.svg?branch=main)](https://kunyuan.github.io/QuSpin.jl/dev/)
+[![Julia 1.10+](https://img.shields.io/badge/Julia-1.10%2B-9558B2?logo=julia)](https://julialang.org/)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
+
 Julia-native reconstruction of QuSpin's documented public API, generated and
 verified through Minos. Python QuSpin is used only as an offline oracle; this
 package has no Python runtime dependency.
@@ -7,6 +12,22 @@ package has no Python runtime dependency.
 The scientific behavior is cross-checked against the BSD-3-Clause
 [QuSpin](https://github.com/QuSpin/QuSpin) project. This repository is an
 independent Julia implementation rather than a Python binding.
+
+## Installation
+
+QuSpin.jl currently installs directly from GitHub:
+
+```julia
+using Pkg
+Pkg.add(url="https://github.com/kunyuan/QuSpin.jl")
+```
+
+The package supports Julia 1.10 and later. See the
+[development documentation](https://kunyuan.github.io/QuSpin.jl/dev/) for the
+getting-started guide, complete tutorials, cookbook, benchmarks, and generated
+API reference.
+
+## Compatibility coverage
 
 The current migration covers the frozen QuSpin 1.0.1 denominator:
 
@@ -26,6 +47,8 @@ The compatibility map and exact frozen denominator live in the Minos QuSpin
 campaign; the independent verification repository checks the public package
 without importing Python.
 
+## Quick start
+
 ```julia
 using QuSpin, LinearAlgebra
 
@@ -33,6 +56,14 @@ basis = SpinBasis1D(4; nup=2, pauli=false)
 terms = [OperatorTerm("zz", [(1.0, 1, 2)])]
 H = Hamiltonian(basis, terms)
 eigvals(H)
+```
+
+For a sparse partial spectrum:
+
+```julia
+H = Hamiltonian(basis, terms; static_fmt=:csc)
+values, vectors = eigsh(H; k=2, which=:SA)
+@assert norm(Matrix(H) * vectors - vectors * Diagonal(values)) < 1e-9
 ```
 
 ## Dense and sparse storage
@@ -119,3 +150,67 @@ used in the literature: random-field XXZ mid-spectrum states
 periodically driven spin chain (QuSpin paper, arXiv:1610.03042). These tests
 validate the numerical workflow and storage path; they do not claim to
 reproduce the papers' finite-size scaling results.
+
+## Documentation
+
+The documentation is built with
+[Documenter.jl](https://documenter.juliadocs.org/) from source docstrings and
+executable examples. Build it locally with:
+
+```sh
+julia --project=docs -e '
+    using Pkg
+    Pkg.develop(PackageSpec(path=pwd()))
+    Pkg.instantiate()
+'
+julia --project=docs docs/make.jl
+```
+
+The strict build checks that every exported binding has a docstring and that
+all tutorial examples execute successfully.
+
+## Tests
+
+Run the public unit, property, regression, and workflow suite with:
+
+```sh
+julia --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
+```
+
+Public tests cover all exported API families, storage representations,
+symmetry and particle sectors, operator algebra, fermionic signs, Krylov
+paths, time evolution, archive interchange, and paper-shaped workflows. A
+separate verification repository retains held-out sizes, coefficients, and
+Python-oracle observations.
+
+## Benchmarks
+
+The `benchmark/` environment contains reproducible `BenchmarkTools` workloads
+for basis construction, native CSC Hamiltonian assembly, sparse matrix-vector
+action, and iterative eigensolvers:
+
+```sh
+julia --project=benchmark -e '
+    using Pkg
+    Pkg.develop(path=pwd())
+    Pkg.instantiate()
+'
+JULIA_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    julia --project=benchmark benchmark/benchmarks.jl
+```
+
+Correctness checks run outside timed regions. Hosted-runner benchmarks are
+observational and are not used as noisy pass/fail gates.
+
+## Contributing
+
+Changes to public behavior should include a focused unit or property test,
+the relevant docstring update, and an independent verification case when they
+close a semantic gap. Performance changes should report controlled storage,
+thread counts, raw sample statistics, allocations, and physical residuals.
+
+## License
+
+QuSpin.jl is available under the [BSD 3-Clause License](LICENSE). The Python
+QuSpin project is used only as an offline scientific-behavior oracle and is not
+a runtime dependency.

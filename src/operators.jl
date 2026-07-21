@@ -1,3 +1,7 @@
+"""
+Hamiltonians, parameterized and matrix-free operators, sparse storage adapters,
+eigensolvers, evolution, and persistence for `QuSpin`.
+"""
 module Operators
 
 using Arpack
@@ -1099,6 +1103,42 @@ function Base.:*(
         size(value, 2),
     )
     return mul!(output, operator, value)
+end
+for StructuredMatrixRHS in _STRUCTURED_MATRIX_RHS_TYPES
+    @eval function Base.:*(
+        operator::ActionLinearOperator{T},
+        value::$StructuredMatrixRHS,
+    ) where {T}
+        output = zeros(
+            promote_type(T, eltype(value)),
+            size(operator, 1),
+            size(value, 2),
+        )
+        return mul!(output, operator, value)
+    end
+    @eval function LinearAlgebra.mul!(
+        output::AbstractMatrix,
+        operator::ActionLinearOperator,
+        value::$StructuredMatrixRHS,
+        alpha::Number=true,
+        beta::Number=false,
+    )
+        return invoke(
+            mul!,
+            Tuple{
+                AbstractMatrix,
+                ActionLinearOperator,
+                AbstractMatrix,
+                Number,
+                Number,
+            },
+            output,
+            operator,
+            value,
+            alpha,
+            beta,
+        )
+    end
 end
 function Base.getindex(operator::ActionLinearOperator{T}, row::Int, column::Int) where {T}
     input = zeros(T, operator.n)
@@ -3020,6 +3060,40 @@ function LinearAlgebra.mul!(
     end
     return output
 end
+for StructuredMatrixRHS in _STRUCTURED_MATRIX_RHS_TYPES
+    @eval Base.:*(
+        operator::QuantumLinearOperator,
+        value::$StructuredMatrixRHS,
+    ) = _apply_linear(operator, value)
+    @eval function LinearAlgebra.mul!(
+        output::AbstractMatrix,
+        operator::QuantumLinearOperator,
+        value::$StructuredMatrixRHS,
+        alpha::Number,
+        beta::Number,
+    )
+        return invoke(
+            mul!,
+            Tuple{
+                AbstractMatrix,
+                QuantumLinearOperator,
+                AbstractMatrix,
+                Number,
+                Number,
+            },
+            output,
+            operator,
+            value,
+            alpha,
+            beta,
+        )
+    end
+    @eval LinearAlgebra.mul!(
+        output::AbstractMatrix,
+        operator::QuantumLinearOperator,
+        value::$StructuredMatrixRHS,
+    ) = mul!(output, operator, value, true, false)
+end
 LinearAlgebra.ishermitian(operator::QuantumLinearOperator) = operator.hermitian
 LinearAlgebra.issymmetric(operator::QuantumLinearOperator) =
     eltype(operator) <: Real && operator.hermitian
@@ -3618,6 +3692,20 @@ end
     ::AbstractDict{K,V},
 ) where {T,K,V} = promote_type(T, V)
 
+function _dense_parameter_matrix(
+    operator::QuantumOperator{T},
+    pars::AbstractDict{K,V},
+) where {T,K,V}
+    _check_quantum_parameters(operator, pars)
+    R = promote_type(T, V)
+    result = zeros(R, size(operator)...)
+    for (key, matrix) in operator.components
+        coefficient = get(pars, key, one(R))
+        iszero(coefficient) || (result .+= coefficient .* matrix)
+    end
+    return result
+end
+
 function _parameter_matrix(
     operator::QuantumOperator,
     pars::AbstractDict=Dict{Any,eltype(operator)}(),
@@ -3633,10 +3721,15 @@ function _parameter_matrix(
     return result
 end
 
-Base.size(operator::QuantumOperator) = size(first(values(operator.components)))
-Base.size(operator::QuantumOperator, dimension::Integer) =
-    size(first(values(operator.components)), dimension)
-Base.eltype(operator::QuantumOperator) = eltype(first(values(operator.components)))
+function Base.size(operator::QuantumOperator)
+    matrix = first(values(getfield(operator, :components)))
+    return (Int(size(matrix, 1)), Int(size(matrix, 2)))
+end
+function Base.size(operator::QuantumOperator, dimension::Integer)
+    matrix = first(values(getfield(operator, :components)))
+    return Int(size(matrix, dimension))
+end
+Base.eltype(::QuantumOperator{T}) where {T} = T
 
 function Base.getproperty(operator::QuantumOperator, name::Symbol)
     name === :H && return adjoint(operator)
@@ -3763,12 +3856,13 @@ function astype(
     )
 end
 
-toarray(
+function toarray(
     operator::QuantumOperator;
     pars::AbstractDict=Dict{Any,eltype(operator)}(),
     out=nothing,
-) =
-    _copy_or_write(Matrix(_parameter_matrix(operator, pars)), out)
+)
+    return _copy_or_write(_dense_parameter_matrix(operator, pars), out)
+end
 todense(operator::QuantumOperator; kwargs...) = toarray(operator; kwargs...)
 tocsc(
     operator::QuantumOperator;

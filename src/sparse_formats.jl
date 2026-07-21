@@ -1,3 +1,14 @@
+# Define multiplication methods for these types individually. Julia 1.10's
+# LinearAlgebra uses several narrower structured-matrix unions, so one combined
+# RHS union would leave method intersections ambiguous.
+const _STRUCTURED_MATRIX_RHS_TYPES = (
+    Bidiagonal,
+    Diagonal,
+    SymTridiagonal,
+    Tridiagonal,
+    LinearAlgebra.AbstractTriangular,
+)
+
 """
     SparseMatrixCSR(matrix)
 
@@ -190,6 +201,25 @@ LinearAlgebra.mul!(
     alpha::Number,
     beta::Number,
 ) = _csr_mul!(result, matrix, value, alpha, beta)
+
+for StructuredMatrixRHS in _STRUCTURED_MATRIX_RHS_TYPES
+    @eval Base.:*(
+        matrix::SparseMatrixCSR,
+        value::$StructuredMatrixRHS,
+    ) = _csr_mul(matrix, value)
+    @eval LinearAlgebra.mul!(
+        result::AbstractMatrix,
+        matrix::SparseMatrixCSR,
+        value::$StructuredMatrixRHS,
+    ) = _csr_mul!(result, matrix, value, true, false)
+    @eval LinearAlgebra.mul!(
+        result::AbstractMatrix,
+        matrix::SparseMatrixCSR,
+        value::$StructuredMatrixRHS,
+        alpha::Number,
+        beta::Number,
+    ) = _csr_mul!(result, matrix, value, alpha, beta)
+end
 
 function _csr_transpose(matrix::SparseMatrixCSR{T}; conjugate::Bool=false) where {T}
     rowptr = zeros(Int, matrix.n + 1)
@@ -415,6 +445,25 @@ LinearAlgebra.mul!(
     alpha::Number,
     beta::Number,
 ) = _dia_mul!(result, matrix, value, alpha, beta)
+
+for StructuredMatrixRHS in _STRUCTURED_MATRIX_RHS_TYPES
+    @eval Base.:*(
+        matrix::DIAMatrix,
+        value::$StructuredMatrixRHS,
+    ) = _dia_mul(matrix, value)
+    @eval LinearAlgebra.mul!(
+        result::AbstractMatrix,
+        matrix::DIAMatrix,
+        value::$StructuredMatrixRHS,
+    ) = _dia_mul!(result, matrix, value, true, false)
+    @eval LinearAlgebra.mul!(
+        result::AbstractMatrix,
+        matrix::DIAMatrix,
+        value::$StructuredMatrixRHS,
+        alpha::Number,
+        beta::Number,
+    ) = _dia_mul!(result, matrix, value, alpha, beta)
+end
 
 function _dia_transpose(matrix::DIAMatrix{T}; conjugate::Bool=false) where {T}
     offsets = Int[-offset for offset in Iterators.reverse(matrix.offsets)]
