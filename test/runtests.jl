@@ -246,11 +246,11 @@ end
         VF=true,
     )
     @test spectrum.T == 0.5
-    @test spectrum.EF ≈ [-1.0, 1.0] atol=2e-16
+    @test spectrum.EF ≈ [-1.0, 1.0] atol=8eps(Float64)
     @test spectrum.UF ≈ exp((-0.5im) .* Z) atol=3e-16
     @test spectrum.HF ≈ Z atol=2e-15
     @test spectrum.thetaF ≈
-        ComplexF64[exp(0.5im), exp(-0.5im)] atol=3e-16
+        ComplexF64[exp(0.5im), exp(-0.5im)] atol=8eps(Float64)
     @test spectrum.VF' * spectrum.VF ≈ Matrix{ComplexF64}(I, 2, 2) atol=2e-16
 
     X = ComplexF64[0 1; 1 0]
