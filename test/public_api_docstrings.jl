@@ -6,7 +6,7 @@
         );
         by=string,
     )
-    @test length(exported) == 131
+    @test length(exported) == 138
     for name in exported
         has_documentation = if isdefined(Docs, :hasdoc)
             getfield(Docs, :hasdoc)(QuSpin, name)

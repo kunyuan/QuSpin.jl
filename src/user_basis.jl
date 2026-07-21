@@ -13,6 +13,59 @@ struct UserBasis{T<:Integer,A<:Tuple,N} <: AbstractBasis
     user_noncommuting_bits::N
 end
 
+"""
+    constraint_states(N; sps=2, prefix_allowed, state_allowed, dtype=UInt64)
+
+Enumerate finite-product states without scanning the full `sps^N` space.
+`prefix_allowed(occupations, site)` is called while a prefix is being built
+and may prune the entire remaining branch. `state_allowed(occupations)` is
+called only for complete states. Occupations use the same convention as the
+built-in discrete bases: site one is the least-significant encoded digit.
+
+The returned encoded states can be passed directly to `UserBasis(...;
+states=...)`. This is intended for reusable local constraints such as Rydberg
+blockade, hard local exclusions, and finite-state automata; it does not attach
+model-specific operator semantics.
+"""
+function constraint_states(
+    N::Integer;
+    sps::Integer=2,
+    prefix_allowed=(occupations, site) -> true,
+    state_allowed=occupations -> true,
+    dtype::Type{T}=UInt64,
+) where {T<:Unsigned}
+    N > 0 || throw(ArgumentError("N must be positive"))
+    sps > 0 || throw(ArgumentError("sps must be positive"))
+    maximum_state = BigInt(sps)^N - 1
+    maximum_state <= typemax(T) ||
+        throw(ArgumentError("state encoding exceeds $T"))
+
+    occupations = zeros(Int, N)
+    weights = T[T(sps)^(site - 1) for site in 1:N]
+    encoded = T[]
+
+    function append_prefix!(site::Int, value::T)
+        if site > N
+            state_allowed(occupations) && push!(encoded, value)
+            return
+        end
+        for occupation in 0:(sps - 1)
+            occupations[site] = occupation
+            prefix_allowed(occupations, site) || continue
+            append_prefix!(
+                site + 1,
+                value + T(occupation) * weights[site],
+            )
+        end
+        occupations[site] = 0
+        return
+    end
+
+    append_prefix!(1, zero(T))
+    sort!(encoded)
+    return encoded
+end
+
 _user_dict_get(dictionary::AbstractDict, key::Symbol, default=nothing) =
     haskey(dictionary, key) ?
     dictionary[key] :

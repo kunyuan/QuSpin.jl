@@ -39,6 +39,10 @@ The current migration covers the frozen QuSpin 1.0.1 denominator:
 - static and time-dependent Hamiltonians, parameterized operators, and
   matrix-exponential actions;
 - evolution, Lanczos, measurements, Floquet, and symmetry-block tools;
+- dynamical correlators, Lehmann/Krylov response spectra, and gauge-invariant
+  eigenspace tracking;
+- prefix-pruned constrained state generation and matrix-free Lindblad
+  density-matrix evolution;
 - native and Python-compatible `QuantumOperator` persistence.
 
 Python names are translated to Julia conventions where appropriate: types use
