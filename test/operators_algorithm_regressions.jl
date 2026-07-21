@@ -95,6 +95,47 @@ end
         @test !isempty(unchecked_qlo.action_terms)
         @test unchecked_qlo * reduced_vector ≈
             unchecked_reference * reduced_vector atol=2e-14
+
+        translation_basis = SpinBasis1D(
+            8;
+            nup=4,
+            pauli=false,
+            kblock=0,
+        )
+        translation_terms = [
+            OperatorTerm(
+                "+-",
+                [(0.5, site, mod1(site + 1, 8)) for site in 1:8],
+            ),
+            OperatorTerm(
+                "-+",
+                [(0.5, site, mod1(site + 1, 8)) for site in 1:8],
+            ),
+            OperatorTerm(
+                "zz",
+                [(0.9, site, mod1(site + 1, 8)) for site in 1:8],
+            ),
+        ]
+        translation_H = Hamiltonian(
+            translation_basis,
+            translation_terms;
+            static_fmt=:csc,
+            check_herm=false,
+            check_symm=false,
+            check_pcon=false,
+        )
+        parent_basis = QuSpin.Basis._spin_parent_basis(translation_basis)
+        parent_H = Hamiltonian(
+            parent_basis,
+            translation_terms;
+            static_fmt=:csc,
+            check_herm=false,
+            check_symm=false,
+            check_pcon=false,
+        )
+        projector = translation_basis.symmetry.projector
+        @test Matrix(translation_H) ≈
+            Matrix(adjoint(projector) * parent_H.data * projector) atol=4e-14
     end
 
     @testset "Krylov ExpOp action, shift, grid, and laziness" begin

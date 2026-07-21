@@ -325,7 +325,21 @@ function _assemble(
     ::Type{T},
     format=:dense,
 ) where {T}
-    if basis isa SpinBasis1D && Basis._has_symmetry(basis.symmetry)
+    if basis isa SpinBasis1D &&
+       Basis._has_symmetry(basis.symmetry) &&
+       !haskey(basis.symmetry.blocks, :block_order)
+        parent = Basis._spin_parent_basis(basis)
+        parent_matrix = _assemble(parent, terms, T, :csc)
+        projected = _convert_projected_sparse(
+            T,
+            sparse(
+                adjoint(basis.symmetry.projector) *
+                parent_matrix *
+                basis.symmetry.projector,
+            ),
+        )
+        return _matrix_with_format(projected, T, format)
+    elseif basis isa SpinBasis1D && Basis._has_symmetry(basis.symmetry)
         projected = spzeros(T, length(basis), length(basis))
         for term in terms
             projected += _convert_projected_sparse(
@@ -1700,6 +1714,33 @@ function _krylov_expmv_times(
     return results
 end
 
+function _krylov_expmv_times(
+    operator,
+    values::AbstractMatrix,
+    scales::AbstractVector;
+    kwargs...,
+)
+    size(operator, 1) == size(operator, 2) == size(values, 1) ||
+        throw(DimensionMismatch("operator and matrix dimensions do not match"))
+    T = promote_type(eltype(operator), eltype(values), eltype(scales))
+    results = Array{T,3}(
+        undef,
+        size(values, 1),
+        size(values, 2),
+        length(scales),
+    )
+    for column in axes(values, 2)
+        states = _krylov_expmv_times(
+            operator,
+            @view(values[:, column]),
+            scales;
+            kwargs...,
+        )
+        copyto!(@view(results[:, column, :]), states)
+    end
+    return results
+end
+
 _krylov_expmv(operator, value::AbstractVector, scale::Number; kwargs...) =
     _krylov_expmv_vector(operator, value, scale; kwargs...)
 
@@ -1928,18 +1969,12 @@ function evolve(
             scalar_target && return copy(@view(states[:, 1]))
             return states
         end
-        batch_states = cat(
-            (
-                _krylov_expmv(
-                    H.data,
-                    v0,
-                    scale;
-                    tol=get(kwargs, :tol, 1e-12),
-                    krylov_dim=get(kwargs, :krylov_dim, 30),
-                )
-                for scale in scales
-            )...;
-            dims=3,
+        batch_states = _krylov_expmv_times(
+            H.data,
+            v0,
+            scales;
+            tol=get(kwargs, :tol, 1e-12),
+            krylov_dim=get(kwargs, :krylov_dim, 30),
         )
         if imag_time
             for index in axes(batch_states, 3), column in axes(batch_states, 2)

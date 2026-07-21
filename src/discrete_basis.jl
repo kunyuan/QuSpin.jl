@@ -1700,31 +1700,21 @@ end
     return count_ones(encoded & (weights[site] - UInt64(1)))
 end
 
-function _fermion_prefix_encoded(
+@inline function _fermion_prefix_encoded(
     basis::DiscreteBasis{:spinful_fermion},
     encoded::UInt64,
     species::Symbol,
     site::Int,
     weights,
 )
-    count = 0
-    if species === :down
-        @inbounds for index in 1:basis.L
-            count += _spinful_encoded_occupation(
-                encoded,
-                weights[index],
-                :up,
-            )
-        end
-    end
-    @inbounds for index in 1:(site - 1)
-        count += _spinful_encoded_occupation(
-            encoded,
-            weights[index],
-            species,
-        )
-    end
-    return count
+    # A radix-four spinful state stores the up/down occupations as the
+    # even/odd bits of each two-bit site digit.  Count the Jordan-Wigner
+    # prefix directly instead of scanning all sites for every local action.
+    lower_site_bits = (UInt64(1) << (2 * (site - 1))) - UInt64(1)
+    up_bits = encoded & UInt64(0x5555555555555555)
+    species === :up && return count_ones(up_bits & lower_site_bits)
+    down_bits = encoded & UInt64(0xaaaaaaaaaaaaaaaa)
+    return count_ones(up_bits) + count_ones(down_bits & lower_site_bits)
 end
 
 """
