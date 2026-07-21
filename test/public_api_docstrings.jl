@@ -8,7 +8,11 @@
     )
     @test length(exported) == 131
     for name in exported
-        binding = Docs.Binding(QuSpin, name)
-        @test Docs.doc(binding) !== nothing
+        has_documentation = if isdefined(Docs, :hasdoc)
+            getfield(Docs, :hasdoc)(QuSpin, name)
+        else
+            Docs.doc(Docs.Binding(QuSpin, name)) !== nothing
+        end
+        @test has_documentation
     end
 end
